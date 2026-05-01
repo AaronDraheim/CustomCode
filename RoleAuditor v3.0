@@ -1,0 +1,1370 @@
+# Get-RoleAssignments.ps1 v3.0
+# Exports role assignments from: Entra ID, PIM, Sentinel, Defender for Cloud, Purview, Defender XDR
+#
+# Revised authentication model:
+#   One App Registration + one certificate used across:
+#     - Microsoft Graph PowerShell
+#     - Azure PowerShell / Az.Accounts
+#     - Defender / XDR REST APIs
+#     - Purview / Security & Compliance PowerShell
+#
+# Goal:
+#   Fully non-interactive after initial certificate configuration prompt.
+#
+# Required App Registration permissions / roles:
+#
+# Microsoft Graph application permissions, admin consent required:
+#   RoleManagement.Read.All
+#   Directory.Read.All
+#   User.Read.All
+#   Group.Read.All
+#   Application.Read.All
+#   AppRoleAssignment.Read.All
+#   PrivilegedAccess.Read.AzureADGroup        # Required if using PIM-for-Groups expansion
+#
+# Azure RBAC:
+#   Reader, Security Reader, or more specific scoped RBAC assignment at the subscription,
+#   resource group, or workspace scope required for Sentinel / Defender for Cloud scans.
+#
+# Office 365 Exchange Online application permission:
+#   Exchange.ManageAsApp
+#
+# Purview / Security & Compliance RBAC:
+#   Assign the app/service principal the required Exchange/Purview RBAC permissions for:
+#     Get-RoleGroup
+#     Get-RoleGroupMember
+#
+# Defender APIs application permissions, admin consent required:
+#   WindowsDefenderATP:
+#     Machine.Read.All
+#     SecurityConfiguration.Read.All
+#     AdvancedQuery.Read.All
+#   Microsoft Threat Protection:
+#     AdvancedHunting.Read.All
+#
+#Requires -Version 5.1
+
+[CmdletBinding()]
+param(
+    [Parameter(HelpMessage = "Array of Sentinel workspace definitions: @{ WorkspaceId=''; ResourceGroup=''; SubscriptionId='' }")]
+    [hashtable[]]$SentinelWorkspaces = @(),
+
+    [Parameter(HelpMessage = "Output folder path.")]
+    [string]$OutputPath = ".\RoleAssignments_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
+
+    [Parameter(HelpMessage = "Export format: CSV, JSON, or Both.")]
+    [ValidateSet("CSV", "JSON", "Both")]
+    [string]$ExportFormat = "Both",
+
+    [Parameter(HelpMessage = "Include PIM eligible role assignments. Requires Entra ID P2 and required Graph permissions.")]
+    [switch]$IncludePIM,
+
+    [Parameter(HelpMessage = "Scan all accessible subscriptions for Defender for Cloud RBAC.")]
+    [switch]$ScanDefenderForCloud,
+
+    [Parameter(HelpMessage = "Export Purview compliance role groups and members.")]
+    [switch]$IncludePurview,
+
+    [Parameter(HelpMessage = "Export full XDR RBAC / Advanced Hunting identity audit.")]
+    [switch]$IncludeXDRRBAC,
+
+    [Parameter(HelpMessage = "App Registration Client ID.")]
+    [string]$AppClientId,
+
+    [Parameter(HelpMessage = "Tenant ID for app-only authentication.")]
+    [string]$TenantId,
+
+    [Parameter(HelpMessage = "Primary tenant domain for Exchange/Purview app-only auth, for example contoso.onmicrosoft.com.")]
+    [string]$Organization,
+
+    [Parameter(HelpMessage = "Certificate thumbprint from CurrentUser or LocalMachine certificate store.")]
+    [string]$CertificateThumbprint,
+
+    [Parameter(HelpMessage = "Optional PFX path. If provided, the certificate is loaded and imported into CurrentUser\My for module compatibility.")]
+    [string]$CertificateFilePath,
+
+    [Parameter(HelpMessage = "Optional PFX password. If not provided with CertificateFilePath, script prompts once.")]
+    [securestring]$CertificatePassword,
+
+    [Parameter(HelpMessage = "Skip prompts and fail if required auth values are missing.")]
+    [switch]$NonInteractiveStrict
+)
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+function Write-Header {
+    param([string]$Text)
+    Write-Host ""
+    Write-Host ("=" * 75) -ForegroundColor Cyan
+    Write-Host "  $Text" -ForegroundColor Cyan
+    Write-Host ("=" * 75) -ForegroundColor Cyan
+}
+
+function Write-Step {
+    param([string]$Text)
+    Write-Host "  >> $Text" -ForegroundColor Yellow
+}
+
+function Write-OK {
+    param([string]$Text)
+    Write-Host "  [OK] $Text" -ForegroundColor Green
+}
+
+function Write-Warn {
+    param([string]$Text)
+    Write-Host "  [WARN] $Text" -ForegroundColor DarkYellow
+}
+
+function Stop-Script {
+    param([string]$Message)
+    Write-Error $Message
+    exit 1
+}
+
+function Export-Results {
+    param(
+        [object[]]$Data,
+        [string]$FileName,
+        [string]$Format
+    )
+
+    if (-not $Data -or @($Data).Count -eq 0) {
+        Write-Warn "No data to export for: $FileName"
+        return
+    }
+
+    if ($Format -in @("CSV", "Both")) {
+        $Data | Export-Csv -Path "$OutputPath\$FileName.csv" -NoTypeInformation -Encoding UTF8
+        Write-OK "Exported $(@($Data).Count) rows -> $FileName.csv"
+    }
+
+    if ($Format -in @("JSON", "Both")) {
+        $Data | ConvertTo-Json -Depth 8 | Out-File "$OutputPath\$FileName.json" -Encoding UTF8
+        Write-OK "Exported $(@($Data).Count) rows -> $FileName.json"
+    }
+}
+
+function Read-RequiredValue {
+    param(
+        [string]$CurrentValue,
+        [string]$Prompt,
+        [string]$Name
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($CurrentValue)) {
+        return $CurrentValue
+    }
+
+    if ($NonInteractiveStrict) {
+        Stop-Script "$Name is required. Provide it as a parameter or run without -NonInteractiveStrict to allow a one-time prompt."
+    }
+
+    $value = Read-Host $Prompt
+
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        Stop-Script "$Name is required."
+    }
+
+    return $value
+}
+
+function ConvertTo-PlainText {
+    param([securestring]$SecureString)
+
+    if (-not $SecureString) {
+        return $null
+    }
+
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    }
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
+
+function Get-CertificateFromStore {
+    param([string]$Thumbprint)
+
+    $cleanThumbprint = ($Thumbprint -replace "\s", "").ToUpperInvariant()
+
+    $cert = Get-ChildItem -Path Cert:\CurrentUser\My -ErrorAction SilentlyContinue |
+        Where-Object { $_.Thumbprint -eq $cleanThumbprint } |
+        Select-Object -First 1
+
+    if (-not $cert) {
+        $cert = Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
+            Where-Object { $_.Thumbprint -eq $cleanThumbprint } |
+            Select-Object -First 1
+    }
+
+    return $cert
+}
+
+function Get-AuthCertificate {
+    Write-Step "Resolving certificate for app-only authentication..."
+
+    if (-not [string]::IsNullOrWhiteSpace($CertificateFilePath)) {
+        if (-not (Test-Path $CertificateFilePath)) {
+            Stop-Script "CertificateFilePath does not exist: $CertificateFilePath"
+        }
+
+        if (-not $CertificatePassword) {
+            if ($NonInteractiveStrict) {
+                Stop-Script "CertificatePassword is required when using CertificateFilePath with -NonInteractiveStrict."
+            }
+
+            $script:CertificatePassword = Read-Host "Enter PFX password" -AsSecureString
+        }
+
+        $plainPassword = ConvertTo-PlainText -SecureString $script:CertificatePassword
+
+        try {
+            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+                $CertificateFilePath,
+                $plainPassword,
+                [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable `
+                    -bor [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::PersistKeySet
+            )
+        }
+        catch {
+            Stop-Script "Failed to load PFX certificate. Error: $_"
+        }
+
+        if (-not $cert.HasPrivateKey) {
+            Stop-Script "The PFX certificate does not contain a private key."
+        }
+
+        if ($cert.NotAfter -lt (Get-Date)) {
+            Stop-Script "The certificate is expired. Thumbprint: $($cert.Thumbprint)"
+        }
+
+        try {
+            $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("My", "CurrentUser")
+            $store.Open("ReadWrite")
+            $existing = $store.Certificates | Where-Object { $_.Thumbprint -eq $cert.Thumbprint } | Select-Object -First 1
+            if (-not $existing) {
+                $store.Add($cert)
+                Write-OK "Imported PFX certificate into CurrentUser\My for module compatibility."
+            }
+            $store.Close()
+        }
+        catch {
+            Write-Warn "Could not import certificate into CurrentUser\My. Some modules may require the certificate to be in the certificate store. Error: $_"
+        }
+
+        $script:CertificateThumbprint = $cert.Thumbprint
+        Write-OK "Loaded certificate from PFX. Thumbprint: $($cert.Thumbprint)"
+        return $cert
+    }
+
+    if ([string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
+        if ($NonInteractiveStrict) {
+            Stop-Script "CertificateThumbprint or CertificateFilePath is required."
+        }
+
+        Write-Host ""
+        Write-Host "Certificate authentication options:" -ForegroundColor Cyan
+        Write-Host "  1. Use certificate thumbprint from certificate store"
+        Write-Host "  2. Use PFX certificate file"
+        Write-Host ""
+
+        $choice = Read-Host "Enter 1 or 2"
+
+        switch ($choice) {
+            "1" {
+                $script:CertificateThumbprint = Read-Host "Enter certificate thumbprint"
+            }
+            "2" {
+                $script:CertificateFilePath = Read-Host "Enter full PFX file path"
+                if (-not (Test-Path $script:CertificateFilePath)) {
+                    Stop-Script "CertificateFilePath does not exist: $script:CertificateFilePath"
+                }
+                $script:CertificatePassword = Read-Host "Enter PFX password" -AsSecureString
+                return Get-AuthCertificate
+            }
+            default {
+                Stop-Script "Invalid certificate authentication choice."
+            }
+        }
+    }
+
+    $certFromStore = Get-CertificateFromStore -Thumbprint $script:CertificateThumbprint
+
+    if (-not $certFromStore) {
+        Stop-Script "Certificate with thumbprint '$script:CertificateThumbprint' was not found in CurrentUser\My or LocalMachine\My."
+    }
+
+    if (-not $certFromStore.HasPrivateKey) {
+        Stop-Script "Certificate '$script:CertificateThumbprint' was found, but it does not have a private key."
+    }
+
+    if ($certFromStore.NotAfter -lt (Get-Date)) {
+        Stop-Script "Certificate '$script:CertificateThumbprint' is expired."
+    }
+
+    Write-OK "Resolved certificate from store. Thumbprint: $($certFromStore.Thumbprint)"
+    return $certFromStore
+}
+
+function ConvertTo-Base64Url {
+    param([byte[]]$Bytes)
+
+    return [Convert]::ToBase64String($Bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+}
+
+function New-ClientAssertion {
+    param(
+        [string]$ClientId,
+        [string]$TenantId,
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate
+    )
+
+    $now = [DateTimeOffset]::UtcNow
+    $aud = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+
+    $header = @{
+        alg = "RS256"
+        typ = "JWT"
+        x5t = ConvertTo-Base64Url -Bytes $Certificate.GetCertHash()
+    } | ConvertTo-Json -Compress
+
+    $payload = @{
+        aud = $aud
+        iss = $ClientId
+        sub = $ClientId
+        jti = [guid]::NewGuid().ToString()
+        nbf = $now.ToUnixTimeSeconds()
+        exp = $now.AddMinutes(10).ToUnixTimeSeconds()
+    } | ConvertTo-Json -Compress
+
+    $encodedHeader = ConvertTo-Base64Url -Bytes ([Text.Encoding]::UTF8.GetBytes($header))
+    $encodedPayload = ConvertTo-Base64Url -Bytes ([Text.Encoding]::UTF8.GetBytes($payload))
+    $unsignedJwt = "$encodedHeader.$encodedPayload"
+
+    try {
+        $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Certificate)
+        $signature = $rsa.SignData(
+            [Text.Encoding]::UTF8.GetBytes($unsignedJwt),
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
+        )
+    }
+    catch {
+        Stop-Script "Failed to sign client assertion with certificate private key. Error: $_"
+    }
+
+    $encodedSignature = ConvertTo-Base64Url -Bytes $signature
+    return "$unsignedJwt.$encodedSignature"
+}
+
+function Get-AppOnlyAccessToken {
+    param(
+        [string]$Scope,
+        [string]$ClientId,
+        [string]$TenantId,
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate
+    )
+
+    $clientAssertion = New-ClientAssertion -ClientId $ClientId -TenantId $TenantId -Certificate $Certificate
+    $tokenEndpoint = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+
+    $body = @{
+        client_id             = $ClientId
+        scope                 = $Scope
+        grant_type            = "client_credentials"
+        client_assertion_type = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+        client_assertion      = $clientAssertion
+    }
+
+    try {
+        $response = Invoke-RestMethod -Method POST -Uri $tokenEndpoint -Body $body -ErrorAction Stop
+        return $response.access_token
+    }
+    catch {
+        Write-Warn "Token request failed for scope '$Scope'. Error: $_"
+        return $null
+    }
+}
+
+# =============================================================================
+# Setup
+# =============================================================================
+
+Write-Header "Microsoft Security Stack - Role Assignments Export v3.0"
+
+if (-not (Test-Path $OutputPath)) {
+    New-Item -ItemType Directory -Path $OutputPath | Out-Null
+    Write-OK "Output folder created: $OutputPath"
+}
+
+$requiredModules = @(
+    "Microsoft.Graph.Authentication",
+    "Microsoft.Graph.Identity.DirectoryManagement",
+    "Microsoft.Graph.Users",
+    "Microsoft.Graph.Groups",
+    "Microsoft.Graph.Applications"
+)
+
+if ($IncludePIM) {
+    $requiredModules += "Microsoft.Graph.Identity.Governance"
+}
+
+if ($SentinelWorkspaces.Count -gt 0 -or $ScanDefenderForCloud) {
+    $requiredModules += "Az.Accounts", "Az.Resources"
+}
+
+if ($ScanDefenderForCloud) {
+    $requiredModules += "Az.Security"
+}
+
+if ($IncludePurview) {
+    $requiredModules += "ExchangeOnlineManagement"
+}
+
+$requiredModules = $requiredModules | Sort-Object -Unique
+
+Write-Step "Checking and loading required modules..."
+
+foreach ($mod in $requiredModules) {
+    if (-not (Get-Module -ListAvailable -Name $mod)) {
+        Write-Step "Installing missing module: $mod"
+        try {
+            Install-Module -Name $mod -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Write-OK "Installed: $mod"
+        }
+        catch {
+            Stop-Script "Failed to install module '$mod'. Run manually: Install-Module $mod -Scope CurrentUser -Force -AllowClobber"
+        }
+    }
+
+    try {
+        Import-Module -Name $mod -Force -ErrorAction Stop
+        Write-OK "Imported: $mod"
+    }
+    catch {
+        Stop-Script "Failed to import module '$mod'. Error: $_"
+    }
+}
+
+# Validate ExchangeOnlineManagement version when Purview is enabled.
+if ($IncludePurview) {
+    $exoModule = Get-Module -ListAvailable -Name ExchangeOnlineManagement |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+
+    if (-not $exoModule) {
+        Stop-Script "ExchangeOnlineManagement module is required for Purview / Security & Compliance PowerShell."
+    }
+
+    if ($exoModule.Version -lt [version]"3.0.0") {
+        Stop-Script "ExchangeOnlineManagement version 3.0.0 or later is required for app-only Connect-IPPSSession. Current version: $($exoModule.Version)"
+    }
+
+    Write-OK "ExchangeOnlineManagement version validated: $($exoModule.Version)"
+}
+
+# =============================================================================
+# One-time auth configuration prompt
+# =============================================================================
+
+Write-Header "Authentication Configuration"
+
+$AppClientId = Read-RequiredValue `
+    -CurrentValue $AppClientId `
+    -Prompt "Enter App Registration Client ID" `
+    -Name "AppClientId"
+
+$TenantId = Read-RequiredValue `
+    -CurrentValue $TenantId `
+    -Prompt "Enter Tenant ID" `
+    -Name "TenantId"
+
+if ($IncludePurview) {
+    $Organization = Read-RequiredValue `
+        -CurrentValue $Organization `
+        -Prompt "Enter tenant organization domain for Purview, for example contoso.onmicrosoft.com" `
+        -Name "Organization"
+}
+
+$script:AuthCertificate = Get-AuthCertificate
+
+# =============================================================================
+# Connect: Microsoft Graph
+# =============================================================================
+
+Write-Header "Connecting to Microsoft Graph with app-only certificate auth"
+
+try {
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+
+    Connect-MgGraph `
+        -ClientId $AppClientId `
+        -TenantId $TenantId `
+        -Certificate $script:AuthCertificate `
+        -NoWelcome `
+        -ErrorAction Stop
+
+    $mgCtx = Get-MgContext
+
+    if (-not $mgCtx) {
+        Stop-Script "Microsoft Graph connection did not return a context."
+    }
+
+    Write-OK "Connected to Microsoft Graph."
+    Write-OK "Graph AuthType: $($mgCtx.AuthType)"
+    Write-OK "Graph ClientId: $($mgCtx.ClientId)"
+    Write-OK "Graph TenantId: $($mgCtx.TenantId)"
+}
+catch {
+    Stop-Script "Microsoft Graph connection failed: $_"
+}
+
+# =============================================================================
+# Connect: Azure / Az PowerShell
+# =============================================================================
+
+if ($SentinelWorkspaces.Count -gt 0 -or $ScanDefenderForCloud) {
+    Write-Header "Connecting to Azure with service principal certificate auth"
+
+    try {
+        Disconnect-AzAccount -ErrorAction SilentlyContinue | Out-Null
+
+        Connect-AzAccount `
+            -ServicePrincipal `
+            -ApplicationId $AppClientId `
+            -Tenant $TenantId `
+            -CertificateThumbprint $script:AuthCertificate.Thumbprint `
+            -ErrorAction Stop | Out-Null
+
+        Write-OK "Connected to Azure using service principal certificate authentication."
+    }
+    catch {
+        Stop-Script "Azure connection failed. Confirm the certificate is available in CurrentUser\My or LocalMachine\My and that the app has Azure RBAC access. Error: $_"
+    }
+}
+
+# =============================================================================
+# Connect: Purview / Security & Compliance PowerShell
+# =============================================================================
+
+if ($IncludePurview) {
+    Write-Header "Connecting to Purview / Security & Compliance PowerShell with app-only certificate auth"
+
+    try {
+        Connect-IPPSSession `
+            -AppId $AppClientId `
+            -Certificate $script:AuthCertificate `
+            -Organization $Organization `
+            -ErrorAction Stop
+
+        Write-OK "Connected to Purview / Security & Compliance PowerShell using app-only certificate authentication."
+    }
+    catch {
+        Stop-Script "Purview / Security & Compliance PowerShell connection failed. Confirm Exchange.ManageAsApp, admin consent, and RBAC assignments. Error: $_"
+    }
+}
+
+# =============================================================================
+# Helper: PIM-for-Groups eligible expansion
+# =============================================================================
+
+function Get-PimGroupEligibleMembers {
+    param(
+        [string]$GroupId,
+        [string]$GroupDisplayName
+    )
+
+    $results = @()
+
+    try {
+        $uri = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilitySchedules?`$filter=groupId eq '$GroupId'"
+        $response = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction SilentlyContinue
+        $schedules = @($response.value)
+
+        while ($response.'@odata.nextLink') {
+            $response = Invoke-MgGraphRequest -Method GET -Uri $response.'@odata.nextLink' -ErrorAction SilentlyContinue
+            $schedules += @($response.value)
+        }
+
+        foreach ($s in $schedules) {
+            if ($s.accessId -and $s.accessId -ne "member") {
+                continue
+            }
+
+            try {
+                $u = Get-MgUser -UserId $s.principalId `
+                    -Property "DisplayName,UserPrincipalName,Mail,AccountEnabled,Department,JobTitle" `
+                    -ErrorAction SilentlyContinue
+
+                if ($u) {
+                    $results += [PSCustomObject]@{
+                        MemberDisplayName = $u.DisplayName
+                        MemberUPN         = $u.UserPrincipalName
+                        MemberMail        = $u.Mail
+                        AccountEnabled    = $u.AccountEnabled
+                        Department        = $u.Department
+                        JobTitle          = $u.JobTitle
+                        MemberType        = "User (PIM-eligible via Group: $GroupDisplayName)"
+                        ScheduleExpiry    = $s.scheduleInfo.expiration.endDateTime
+                        ExpiryType        = $s.scheduleInfo.expiration.type
+                    }
+                }
+            }
+            catch {
+                Write-Warn "Could not resolve PIM group member $($s.principalId): $_"
+            }
+        }
+
+        Write-OK "PIM-for-Groups expansion '$GroupDisplayName': $(@($results).Count) eligible member(s)"
+    }
+    catch {
+        Write-Warn "Could not query PIM eligibility schedules for group '$GroupDisplayName'. Ensure PrivilegedAccess.Read.AzureADGroup application permission is granted. Error: $_"
+    }
+
+    return $results
+}
+
+# =============================================================================
+# SECTION 1: Entra ID Directory Roles
+# =============================================================================
+
+Write-Header "1/7 Entra ID - Directory Role Assignments"
+
+$targetEntraRoles = @(
+    "Global Administrator",
+    "Security Administrator",
+    "Security Operator",
+    "Security Reader",
+    "Global Reader",
+    "Compliance Administrator",
+    "Compliance Data Administrator",
+    "Information Protection Administrator",
+    "Helpdesk Administrator",
+    "Intune Administrator"
+)
+
+$entraRoleAssignments = @()
+
+try {
+    Write-Step "Fetching active directory role assignments..."
+
+    $activeRoles = Get-MgDirectoryRole -All -ErrorAction Stop |
+        Where-Object { $_.DisplayName -in $targetEntraRoles }
+
+    Write-OK "Scoping to $(@($activeRoles).Count) target role(s)."
+
+    foreach ($role in $activeRoles) {
+        Write-Step "Processing role: $($role.DisplayName)"
+
+        $members = Get-MgDirectoryRoleMember -DirectoryRoleId $role.Id -All -ErrorAction SilentlyContinue
+
+        foreach ($member in $members) {
+            $memberType = ($member.AdditionalProperties["@odata.type"] -replace "#microsoft.graph.", "")
+
+            switch ($memberType) {
+                "user" {
+                    $u = Get-MgUser -UserId $member.Id `
+                        -Property "DisplayName,UserPrincipalName,Mail,AccountEnabled,UserType,Department,JobTitle" `
+                        -ErrorAction SilentlyContinue
+
+                    if ($u) {
+                        $entraRoleAssignments += [PSCustomObject]@{
+                            RoleName          = $role.DisplayName
+                            RoleId            = $role.Id
+                            RoleDescription   = $role.Description
+                            MemberType        = "User"
+                            MemberDisplayName = $u.DisplayName
+                            MemberUPN         = $u.UserPrincipalName
+                            MemberMail        = $u.Mail
+                            MemberDepartment  = $u.Department
+                            MemberJobTitle    = $u.JobTitle
+                            AccountEnabled    = $u.AccountEnabled
+                            UserType          = $u.UserType
+                            MemberId          = $member.Id
+                            AssignmentType    = "Active"
+                            ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                        }
+                    }
+                }
+
+                "group" {
+                    $g = Get-MgGroup -GroupId $member.Id `
+                        -Property "DisplayName,Mail,GroupTypes" `
+                        -ErrorAction SilentlyContinue
+
+                    if ($g) {
+                        $entraRoleAssignments += [PSCustomObject]@{
+                            RoleName          = $role.DisplayName
+                            RoleId            = $role.Id
+                            RoleDescription   = $role.Description
+                            MemberType        = "Group"
+                            MemberDisplayName = $g.DisplayName
+                            MemberUPN         = $g.Mail
+                            MemberMail        = $g.Mail
+                            MemberDepartment  = ""
+                            MemberJobTitle    = ""
+                            AccountEnabled    = ""
+                            UserType          = "Group"
+                            MemberId          = $member.Id
+                            AssignmentType    = "Active"
+                            ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                        }
+
+                        $directMembers = Get-MgGroupMember -GroupId $member.Id -All -ErrorAction SilentlyContinue
+
+                        foreach ($dm in $directMembers) {
+                            $dmType = ($dm.AdditionalProperties["@odata.type"] -replace "#microsoft.graph.", "")
+
+                            if ($dmType -eq "user") {
+                                $du = Get-MgUser -UserId $dm.Id `
+                                    -Property "DisplayName,UserPrincipalName,Mail,AccountEnabled,Department,JobTitle" `
+                                    -ErrorAction SilentlyContinue
+
+                                if ($du) {
+                                    $entraRoleAssignments += [PSCustomObject]@{
+                                        RoleName          = $role.DisplayName
+                                        RoleId            = $role.Id
+                                        RoleDescription   = $role.Description
+                                        MemberType        = "User (via Group: $($g.DisplayName))"
+                                        MemberDisplayName = $du.DisplayName
+                                        MemberUPN         = $du.UserPrincipalName
+                                        MemberMail        = $du.Mail
+                                        MemberDepartment  = $du.Department
+                                        MemberJobTitle    = $du.JobTitle
+                                        AccountEnabled    = $du.AccountEnabled
+                                        UserType          = "User"
+                                        MemberId          = $dm.Id
+                                        AssignmentType    = "Active via Group"
+                                        ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                                    }
+                                }
+                            }
+                        }
+
+                        if ($IncludePIM) {
+                            Write-Step "Checking PIM-for-Groups eligibility: $($g.DisplayName)"
+                            $pimGroupMembers = Get-PimGroupEligibleMembers -GroupId $member.Id -GroupDisplayName $g.DisplayName
+
+                            foreach ($pgm in $pimGroupMembers) {
+                                $entraRoleAssignments += [PSCustomObject]@{
+                                    RoleName          = $role.DisplayName
+                                    RoleId            = $role.Id
+                                    RoleDescription   = $role.Description
+                                    MemberType        = $pgm.MemberType
+                                    MemberDisplayName = $pgm.MemberDisplayName
+                                    MemberUPN         = $pgm.MemberUPN
+                                    MemberMail        = $pgm.MemberMail
+                                    MemberDepartment  = $pgm.Department
+                                    MemberJobTitle    = $pgm.JobTitle
+                                    AccountEnabled    = $pgm.AccountEnabled
+                                    UserType          = "User"
+                                    MemberId          = ""
+                                    AssignmentType    = "PIM-Eligible via Group"
+                                    ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                "servicePrincipal" {
+                    $sp = Get-MgServicePrincipal -ServicePrincipalId $member.Id `
+                        -Property "DisplayName,AppId,ServicePrincipalType" `
+                        -ErrorAction SilentlyContinue
+
+                    $entraRoleAssignments += [PSCustomObject]@{
+                        RoleName          = $role.DisplayName
+                        RoleId            = $role.Id
+                        RoleDescription   = $role.Description
+                        MemberType        = "ServicePrincipal"
+                        MemberDisplayName = $sp.DisplayName
+                        MemberUPN         = ""
+                        MemberMail        = ""
+                        MemberDepartment  = ""
+                        MemberJobTitle    = ""
+                        AccountEnabled    = ""
+                        UserType          = "ServicePrincipal"
+                        MemberId          = $member.Id
+                        AppId             = $sp.AppId
+                        AssignmentType    = "Active"
+                        ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                    }
+                }
+
+                default {
+                    Write-Warn "Unknown member type '$memberType' for member $($member.Id)"
+                }
+            }
+        }
+    }
+
+    Export-Results -Data $entraRoleAssignments -FileName "1_Entra_Security_Roles" -Format $ExportFormat
+}
+catch {
+    Write-Error "Failed to retrieve Entra ID roles: $_"
+}
+
+# =============================================================================
+# SECTION 2: PIM Eligible Assignments
+# =============================================================================
+
+$pimAssignments = @()
+
+if ($IncludePIM) {
+    Write-Header "2/7 Entra ID - PIM Eligible Role Assignments"
+
+    try {
+        $eligibleAssignments = Get-MgRoleManagementDirectoryRoleEligibilitySchedule -All -ErrorAction Stop
+        Write-OK "Total PIM eligible assignments found: $(@($eligibleAssignments).Count). Filtering to target roles only."
+
+        foreach ($assignment in $eligibleAssignments) {
+            $roleDef = Get-MgRoleManagementDirectoryRoleDefinition `
+                -UnifiedRoleDefinitionId $assignment.RoleDefinitionId `
+                -ErrorAction SilentlyContinue
+
+            if (-not $roleDef -or $roleDef.DisplayName -notin $targetEntraRoles) {
+                continue
+            }
+
+            $principalId = $assignment.PrincipalId
+            $memberType = "Unknown"
+            $displayName = $principalId
+            $upn = ""
+            $mail = ""
+            $department = ""
+
+            $u = Get-MgUser -UserId $principalId `
+                -Property "DisplayName,UserPrincipalName,Mail,Department" `
+                -ErrorAction SilentlyContinue
+
+            if ($u) {
+                $memberType = "User"
+                $displayName = $u.DisplayName
+                $upn = $u.UserPrincipalName
+                $mail = $u.Mail
+                $department = $u.Department
+            }
+            else {
+                $g = Get-MgGroup -GroupId $principalId -Property "DisplayName,Mail" -ErrorAction SilentlyContinue
+                if ($g) {
+                    $memberType = "Group"
+                    $displayName = $g.DisplayName
+                    $mail = $g.Mail
+                }
+                else {
+                    $sp = Get-MgServicePrincipal -ServicePrincipalId $principalId -Property "DisplayName,AppId" -ErrorAction SilentlyContinue
+                    if ($sp) {
+                        $memberType = "ServicePrincipal"
+                        $displayName = $sp.DisplayName
+                    }
+                }
+            }
+
+            $pimAssignments += [PSCustomObject]@{
+                RoleName          = $roleDef.DisplayName
+                RoleId            = $assignment.RoleDefinitionId
+                MemberType        = $memberType
+                MemberDisplayName = $displayName
+                MemberUPN         = $upn
+                MemberMail        = $mail
+                MemberDepartment  = $department
+                AssignmentType    = "PIM-Eligible"
+                ScheduleStartDate = $assignment.ScheduleInfo.StartDateTime
+                ScheduleExpiry    = $assignment.ScheduleInfo.Expiration.EndDateTime
+                ExpiryType        = $assignment.ScheduleInfo.Expiration.Type
+                MembershipType    = $assignment.MemberType
+                Status            = $assignment.Status
+                ExportedAt        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            }
+        }
+
+        Export-Results -Data $pimAssignments -FileName "2_EntraID_PIM_EligibleRoles" -Format $ExportFormat
+    }
+    catch {
+        Write-Warn "PIM data retrieval failed. Confirm Entra ID P2 and Graph permissions. Error: $_"
+    }
+}
+else {
+    Write-Warn "PIM eligible assignments skipped. Use -IncludePIM to include them."
+}
+
+# =============================================================================
+# SECTION 3: Microsoft Sentinel - Workspace RBAC
+# =============================================================================
+
+Write-Header "3/7 Microsoft Sentinel - Workspace RBAC"
+
+$allSentinelRoles = @()
+$customPermissionRows = @()
+
+if ($SentinelWorkspaces.Count -gt 0) {
+    $sentinelRoleNames = @(
+        "Microsoft Sentinel Contributor",
+        "Microsoft Sentinel Reader",
+        "Microsoft Sentinel Responder",
+        "Microsoft Sentinel Automation Contributor",
+        "Log Analytics Contributor",
+        "Log Analytics Reader"
+    )
+
+    foreach ($ws in $SentinelWorkspaces) {
+        if (-not $ws.WorkspaceId -or -not $ws.ResourceGroup -or -not $ws.SubscriptionId) {
+            Write-Warn "Workspace skipped because WorkspaceId, ResourceGroup, or SubscriptionId is missing."
+            continue
+        }
+
+        try {
+            Set-AzContext -SubscriptionId $ws.SubscriptionId -Tenant $TenantId -ErrorAction Stop | Out-Null
+
+            $sentinelScope = "/subscriptions/$($ws.SubscriptionId)/resourceGroups/$($ws.ResourceGroup)"
+
+            $workspaceRoles = Get-AzRoleAssignment -Scope $sentinelScope -ErrorAction Stop |
+                Where-Object { $_.RoleDefinitionName -in $sentinelRoleNames } |
+                ForEach-Object {
+                    [PSCustomObject]@{
+                        WorkspaceId    = $ws.WorkspaceId
+                        ResourceGroup  = $ws.ResourceGroup
+                        SubscriptionId = $ws.SubscriptionId
+                        RoleName       = $_.RoleDefinitionName
+                        PrincipalName  = $_.DisplayName
+                        PrincipalType  = $_.ObjectType
+                        PrincipalId    = $_.ObjectId
+                        SignInName     = $_.SignInName
+                        Scope          = $_.Scope
+                        ExportedAt     = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                    }
+                }
+
+            $allSentinelRoles += @($workspaceRoles)
+            Write-OK "Found $(@($workspaceRoles).Count) Sentinel role assignment(s) for workspace $($ws.WorkspaceId)."
+        }
+        catch {
+            Write-Warn "Failed to retrieve Sentinel roles for workspace $($ws.WorkspaceId). Error: $_"
+        }
+    }
+
+    Export-Results -Data $allSentinelRoles -FileName "3_Sentinel_Workspace_Roles" -Format $ExportFormat
+}
+else {
+    Write-Warn "Sentinel workspace roles skipped. Use -SentinelWorkspaces to provide workspace definitions."
+}
+
+# =============================================================================
+# SECTION 4: Defender for Cloud - Subscription RBAC
+# =============================================================================
+
+Write-Header "4/7 Defender for Cloud - Subscription RBAC"
+
+$mdcSubScan = @()
+$mdcRbacRows = @()
+
+if ($ScanDefenderForCloud) {
+    try {
+        $allSubscriptions = Get-AzSubscription -TenantId $TenantId -ErrorAction Stop
+        Write-OK "Found $(@($allSubscriptions).Count) accessible subscription(s)."
+
+        $mdcTargetRoles = @("Owner", "Contributor", "Security Admin", "Security Reader")
+
+        foreach ($sub in $allSubscriptions) {
+            try {
+                Set-AzContext -SubscriptionId $sub.Id -Tenant $TenantId -ErrorAction Stop | Out-Null
+
+                $pricingTiers = Get-AzSecurityPricing -ErrorAction SilentlyContinue
+                $enabledPlans = @($pricingTiers | Where-Object { $_.PricingTier -eq "Standard" } | Select-Object -ExpandProperty Name)
+                $isMDCEnabled = ($enabledPlans.Count -gt 0)
+
+                $mdcSubScan += [PSCustomObject]@{
+                    SubscriptionId   = $sub.Id
+                    SubscriptionName = $sub.Name
+                    TenantId         = $sub.TenantId
+                    MDCEnabled       = $isMDCEnabled
+                    EnabledPlanCount = $enabledPlans.Count
+                    EnabledPlans     = ($enabledPlans -join "; ")
+                    ExportedAt       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                }
+
+                $subScope = "/subscriptions/$($sub.Id)"
+                $assignments = Get-AzRoleAssignment -Scope $subScope -ErrorAction SilentlyContinue
+
+                foreach ($ra in $assignments) {
+                    if ($ra.RoleDefinitionName -in $mdcTargetRoles) {
+                        $mdcRbacRows += [PSCustomObject]@{
+                            SubscriptionId   = $sub.Id
+                            SubscriptionName = $sub.Name
+                            MDCEnabledPlans  = ($enabledPlans -join "; ")
+                            RoleName         = $ra.RoleDefinitionName
+                            PrincipalName    = $ra.DisplayName
+                            PrincipalType    = $ra.ObjectType
+                            PrincipalId      = $ra.ObjectId
+                            SignInName       = $ra.SignInName
+                            Scope            = $ra.Scope
+                            ExportedAt       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Warn "Could not process subscription $($sub.Name). Error: $_"
+            }
+        }
+
+        Export-Results -Data $mdcSubScan -FileName "4_MDC_Subscription_Scan" -Format $ExportFormat
+        Export-Results -Data $mdcRbacRows -FileName "4_MDC_RBAC_Assignments" -Format $ExportFormat
+    }
+    catch {
+        Write-Error "Defender for Cloud scan failed: $_"
+    }
+}
+else {
+    Write-Warn "Defender for Cloud scan skipped. Use -ScanDefenderForCloud to enable."
+}
+
+# =============================================================================
+# SECTION 5: Microsoft Purview - Compliance Role Groups
+# =============================================================================
+
+Write-Header "5/7 Microsoft Purview - Compliance Role Groups"
+
+$purviewMembers = @()
+
+if ($IncludePurview) {
+    try {
+        $allRoleGroups = Get-RoleGroup -ErrorAction Stop
+        Write-OK "Found $(@($allRoleGroups).Count) compliance role group(s)."
+
+        foreach ($rg in $allRoleGroups) {
+            Write-Step "Processing Purview role group: $($rg.Name)"
+
+            try {
+                $members = Get-RoleGroupMember -Identity $rg.Name -ErrorAction SilentlyContinue
+
+                $roleList = ""
+                try {
+                    $roleList = ($rg.Roles | ForEach-Object {
+                        if ($_ -is [string]) {
+                            ($_ -split "/")[-1]
+                        }
+                        elseif ($_.Name) {
+                            $_.Name
+                        }
+                        else {
+                            ($_.ToString() -split "/")[-1]
+                        }
+                    }) -join "; "
+                }
+                catch {
+                    $roleList = ($rg.Roles -join "; ")
+                }
+
+                if (-not $members -or @($members).Count -eq 0) {
+                    $purviewMembers += [PSCustomObject]@{
+                        RoleGroupName        = $rg.Name
+                        RoleGroupDescription = $rg.Description
+                        RoleGroupType        = $rg.RoleGroupType
+                        AssignedRoles        = $roleList
+                        MemberDisplayName    = "(No members)"
+                        MemberUPN            = ""
+                        MemberMail           = ""
+                        MemberType           = ""
+                        ExportedAt           = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                    }
+                }
+                else {
+                    foreach ($m in $members) {
+                        $purviewMembers += [PSCustomObject]@{
+                            RoleGroupName        = $rg.Name
+                            RoleGroupDescription = $rg.Description
+                            RoleGroupType        = $rg.RoleGroupType
+                            AssignedRoles        = $roleList
+                            MemberDisplayName    = $m.DisplayName
+                            MemberUPN            = if ($m.WindowsLiveId) { $m.WindowsLiveId } elseif ($m.PrimarySmtpAddress) { $m.PrimarySmtpAddress } else { $m.Name }
+                            MemberMail           = $m.PrimarySmtpAddress
+                            MemberType           = $m.RecipientTypeDetails
+                            ExportedAt           = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Warn "Could not process Purview role group '$($rg.Name)'. Error: $_"
+            }
+        }
+
+        Export-Results -Data $purviewMembers -FileName "5_Purview_RoleGroups" -Format $ExportFormat
+    }
+    catch {
+        Write-Error "Purview data retrieval failed. Confirm Exchange.ManageAsApp, admin consent, and RBAC permissions. Error: $_"
+    }
+}
+else {
+    Write-Warn "Purview export skipped. Use -IncludePurview to enable."
+}
+
+# =============================================================================
+# SECTION 6: Microsoft Defender XDR - Advanced Hunting Identity Audit
+# =============================================================================
+
+Write-Header "6/7 Defender XDR - Advanced Hunting Identity Audit"
+
+$mdeIdentityAudit = @()
+
+if ($IncludeXDRRBAC) {
+    $secToken = Get-AppOnlyAccessToken `
+        -Scope "https://api.security.microsoft.com/.default" `
+        -ClientId $AppClientId `
+        -TenantId $TenantId `
+        -Certificate $script:AuthCertificate
+
+    if (-not $secToken) {
+        Write-Warn "Could not acquire Defender XDR token. Ensure Microsoft Threat Protection AdvancedHunting.Read.All application permission is granted."
+    }
+    else {
+        try {
+            $knownUPNs = @()
+            if ($entraRoleAssignments.Count -gt 0) {
+                $knownUPNs = $entraRoleAssignments |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_.MemberUPN) } |
+                    Select-Object -ExpandProperty MemberUPN -Unique
+            }
+
+            $kqlQuery = @'
+let XdrRoles = dynamic([
+    "Global Administrator",
+    "Security Administrator",
+    "Security Operator",
+    "Security Reader",
+    "Global Reader",
+    "Compliance Administrator",
+    "Helpdesk Administrator",
+    "Intune Administrator"
+]);
+IdentityInfo
+| where isnotempty(AssignedRoles)
+| mv-expand AssignedRole = AssignedRoles
+| where AssignedRole in (XdrRoles)
+| summarize arg_max(Timestamp, *) by AccountObjectId
+| project AccountUpn, AccountDisplayName, AccountObjectId, Department, JobTitle,
+          IsAccountEnabled, AssignedRoles, GroupMembership, RiskLevel, BlastRadius, IdentityEnvironment
+| order by AccountDisplayName asc
+'@
+
+            $body = @{ Query = $kqlQuery } | ConvertTo-Json
+            $headers = @{
+                Authorization = "Bearer $secToken"
+                "Content-Type" = "application/json"
+            }
+
+            $ahResult = Invoke-RestMethod `
+                -Method POST `
+                -Uri "https://api.security.microsoft.com/api/advancedhunting/run" `
+                -Headers $headers `
+                -Body $body `
+                -ErrorAction Stop
+
+            foreach ($identity in @($ahResult.Results)) {
+                $rolesStr = if ($identity.AssignedRoles) { ($identity.AssignedRoles | ForEach-Object { $_ }) -join "; " } else { "" }
+                $groupsStr = if ($identity.GroupMembership) { ($identity.GroupMembership | ForEach-Object { $_ }) -join "; " } else { "" }
+                $isBlindSpot = ($identity.AccountUpn -notin $knownUPNs) -and (-not [string]::IsNullOrWhiteSpace($identity.AccountUpn))
+
+                $mdeIdentityAudit += [PSCustomObject]@{
+                    IdentityType         = if ($identity.AccountUpn) { "User" } else { "ServicePrincipalOrApp" }
+                    AccountUPN           = $identity.AccountUpn
+                    DisplayName          = $identity.AccountDisplayName
+                    AccountObjectId      = $identity.AccountObjectId
+                    Department           = $identity.Department
+                    JobTitle             = $identity.JobTitle
+                    IsAccountEnabled     = $identity.IsAccountEnabled
+                    AssignedEntraRoles   = $rolesStr
+                    EntraGroupMembership = $groupsStr
+                    RiskLevel            = $identity.RiskLevel
+                    BlastRadius          = $identity.BlastRadius
+                    IdentityEnvironment  = $identity.IdentityEnvironment
+                    InSection1Export     = if ($isBlindSpot) { "NO - NOT IN ENTRA ROLE EXPORT" } else { "Yes" }
+                    BlindSpotFlag        = if ($isBlindSpot) { "REVIEW REQUIRED" } else { "" }
+                    ExportedAt           = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                }
+            }
+
+            Export-Results -Data $mdeIdentityAudit -FileName "6_MDE_RBAC" -Format $ExportFormat
+        }
+        catch {
+            Write-Warn "Defender XDR Advanced Hunting section failed. Error: $_"
+        }
+    }
+}
+else {
+    Write-Warn "XDR RBAC export skipped. Use -IncludeXDRRBAC to enable."
+}
+
+# =============================================================================
+# SECTION 7: Service Principals & App Registrations — Security Permissions
+# =============================================================================
+
+Write-Header "7/7 Service Principals & App Registrations - Security Permissions"
+
+$spResults = @()
+
+$sensitiveApiPermissions = @(
+    "RoleManagement.Read.All",
+    "RoleManagement.ReadWrite.All",
+    "Directory.Read.All",
+    "Directory.ReadWrite.All",
+    "User.Read.All",
+    "Group.Read.All",
+    "Application.Read.All",
+    "Application.ReadWrite.All",
+    "PrivilegedAccess.Read.AzureADGroup",
+    "PrivilegedAccess.ReadWrite.AzureADGroup",
+    "AdvancedHunting.Read.All",
+    "SecurityEvents.Read.All",
+    "SecurityEvents.ReadWrite.All",
+    "Policy.Read.All",
+    "AuditLog.Read.All",
+    "IdentityRiskyUser.Read.All",
+    "IdentityRiskEvent.Read.All",
+    "Exchange.ManageAsApp"
+)
+
+try {
+    $allSPs = Get-MgServicePrincipal -All -Property "Id,DisplayName,AppId,ServicePrincipalType,AppRoles" -ErrorAction Stop
+    Write-OK "Found $(@($allSPs).Count) service principal(s)."
+
+    foreach ($role in (Get-MgDirectoryRole -All -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -in $targetEntraRoles })) {
+        $members = Get-MgDirectoryRoleMember -DirectoryRoleId $role.Id -All -ErrorAction SilentlyContinue
+
+        foreach ($m in $members) {
+            $odataType = ($m.AdditionalProperties["@odata.type"] -replace "#microsoft.graph.", "")
+
+            if ($odataType -eq "servicePrincipal") {
+                $sp = $allSPs | Where-Object { $_.Id -eq $m.Id } | Select-Object -First 1
+
+                $spResults += [PSCustomObject]@{
+                    SPDisplayName    = $sp.DisplayName
+                    AppId            = $sp.AppId
+                    SPType           = $sp.ServicePrincipalType
+                    PermissionSource = "Entra Role"
+                    Permission       = $role.DisplayName
+                    PermissionScope  = "Entra ID"
+                    IsRunningApp     = if ($sp.AppId -eq $AppClientId) { "YES - THIS IS THE APP RUNNING THE SCRIPT" } else { "" }
+                    ExportedAt       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                }
+            }
+        }
+    }
+
+    $graphSP = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'" -Property "Id,AppRoles" -ErrorAction SilentlyContinue
+    $exoSP = Get-MgServicePrincipal -Filter "appId eq '00000002-0000-0ff1-ce00-000000000000'" -Property "Id,AppRoles" -ErrorAction SilentlyContinue
+    $mtpSP = Get-MgServicePrincipal -Filter "appId eq '8ee8fdad-f234-4243-8f3b-15c294843740'" -Property "Id,AppRoles" -ErrorAction SilentlyContinue
+
+    $roleLookup = @{}
+
+    foreach ($resourceSp in @($graphSP, $exoSP, $mtpSP)) {
+        if ($resourceSp) {
+            foreach ($r in $resourceSp.AppRoles) {
+                $roleLookup[$r.Id.ToString()] = $r.Value
+            }
+        }
+    }
+
+    foreach ($sp in $allSPs) {
+        try {
+            $assignments = Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -All -ErrorAction SilentlyContinue
+
+            foreach ($a in $assignments) {
+                $permName = $null
+
+                if ($roleLookup.ContainsKey($a.AppRoleId.ToString())) {
+                    $permName = $roleLookup[$a.AppRoleId.ToString()]
+                }
+
+                if ($permName -and $permName -in $sensitiveApiPermissions) {
+                    $spResults += [PSCustomObject]@{
+                        SPDisplayName    = $sp.DisplayName
+                        AppId            = $sp.AppId
+                        SPType           = $sp.ServicePrincipalType
+                        PermissionSource = "API Permission (Application)"
+                        Permission       = $permName
+                        PermissionScope  = "Microsoft Graph / Exchange Online / MTP"
+                        IsRunningApp     = if ($sp.AppId -eq $AppClientId) { "YES - THIS IS THE APP RUNNING THE SCRIPT" } else { "" }
+                        ExportedAt       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                    }
+                }
+            }
+        }
+        catch {
+            # Continue scanning other service principals.
+        }
+    }
+
+    if (-not ($spResults | Where-Object { $_.IsRunningApp -eq "YES - THIS IS THE APP RUNNING THE SCRIPT" })) {
+        Write-Warn "Running App Registration ($AppClientId) was not flagged in the security permission output."
+    }
+
+    Export-Results -Data $spResults -FileName "7_ServicePrincipal_SecurityPermissions" -Format $ExportFormat
+}
+catch {
+    Write-Error "Section 7 failed: $_"
+}
+
+# =============================================================================
+# Final Summary
+# =============================================================================
+
+Write-Header "Export Complete"
+
+$files = Get-ChildItem -Path $OutputPath -File -ErrorAction SilentlyContinue
+
+$manifest = [PSCustomObject]@{
+    ExportTimestamp         = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+    TenantId                = $TenantId
+    AppClientId             = $AppClientId
+    CertificateThumbprint   = $script:AuthCertificate.Thumbprint
+    Organization            = $Organization
+    SentinelWorkspaceCount  = $SentinelWorkspaces.Count
+    IncludedPIM             = $IncludePIM.IsPresent
+    ScannedDefenderForCloud = $ScanDefenderForCloud.IsPresent
+    IncludedPurview         = $IncludePurview.IsPresent
+    IncludedXDRRBAC         = $IncludeXDRRBAC.IsPresent
+    EntraRoleCount          = @($entraRoleAssignments).Count
+    PimRoleCount            = @($pimAssignments).Count
+    PurviewRoleGroupCount   = @($purviewMembers).Count
+    MDERBACCount            = @($mdeIdentityAudit).Count
+    FilesGenerated          = @($files).Count
+}
+
+$manifest | ConvertTo-Json -Depth 6 | Out-File "$OutputPath\00_ExportManifest.json" -Encoding UTF8
+Write-OK "Manifest written -> 00_ExportManifest.json"
+
+Write-Host ""
+Write-Host "Files written to: $OutputPath" -ForegroundColor Cyan
+
+foreach ($f in $files) {
+    Write-Host "  $($f.Name) ($([math]::Round($f.Length / 1KB, 1)) KB)" -ForegroundColor White
+}
+
+try {
+    if ($IncludePurview) {
+        Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    }
+}
+catch {}
+
+try {
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+}
+catch {}
+
+try {
+    if ($SentinelWorkspaces.Count -gt 0 -or $ScanDefenderForCloud) {
+        Disconnect-AzAccount -ErrorAction SilentlyContinue | Out-Null
+    }
+}
+catch {}
+
+Write-OK "All sessions disconnected."
+Write-Host ""
+Write-Host "Done." -ForegroundColor Green
