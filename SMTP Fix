@@ -78,7 +78,7 @@ function Select-FilePath {
             "2" {
                 $manualPath = Read-Host "Enter the full file path"
 
-                if (:IsNullOrWhiteSpace($manualPath)) {
+                if ([string]::IsNullOrWhiteSpace($manualPath)) {
                     Write-Host "No file path was entered." -ForegroundColor Red
                     Read-Host "Press Enter to continue"
                 }
@@ -153,7 +153,7 @@ function Select-SaveFilePath {
             "2" {
                 $manualPath = Read-Host "Enter the full output file path"
 
-                if (:IsNullOrWhiteSpace($manualPath)) {
+                if ([string]::IsNullOrWhiteSpace($manualPath)) {
                     Write-Host "No output path was entered." -ForegroundColor Red
                     Read-Host "Press Enter to continue"
                 }
@@ -176,10 +176,10 @@ function Select-SaveFilePath {
 }
 
 function Start-LogIfConfigured {
-    if (-not :IsNullOrWhiteSpace($script:TranscriptPath) -and -not $script:TranscriptStarted) {
+    if (-not [string]::IsNullOrWhiteSpace($script:TranscriptPath) -and -not $script:TranscriptStarted) {
         $TranscriptDirectory = Split-Path -Path $script:TranscriptPath -Parent
 
-        if (-not :IsNullOrWhiteSpace($TranscriptDirectory) -and -not (Test-Path -Path $TranscriptDirectory)) {
+        if (-not [string]::IsNullOrWhiteSpace($TranscriptDirectory) -and -not (Test-Path -Path $TranscriptDirectory)) {
             New-Item -Path $TranscriptDirectory -ItemType Directory -Force | Out-Null
         }
 
@@ -206,21 +206,21 @@ function Add-ErrorRecord {
 }
 
 function Export-ErrorList {
-    if (:IsNullOrWhiteSpace($script:ErrorListPath)) {
+    if ([string]::IsNullOrWhiteSpace($script:ErrorListPath)) {
         $script:ErrorListPath = Select-SaveFilePath `
             -Title "Select error list output path" `
             -Filter "CSV files (*.csv)|*.csv|All files (*.*)|*.*" `
             -DefaultFileName "MailRecipientErrors.csv"
     }
 
-    if (:IsNullOrWhiteSpace($script:ErrorListPath)) {
+    if ([string]::IsNullOrWhiteSpace($script:ErrorListPath)) {
         Write-Host "No error list path was selected." -ForegroundColor Red
         return
     }
 
     $ErrorDirectory = Split-Path -Path $script:ErrorListPath -Parent
 
-    if (-not :IsNullOrWhiteSpace($ErrorDirectory) -and -not (Test-Path -Path $ErrorDirectory)) {
+    if (-not [string]::IsNullOrWhiteSpace($ErrorDirectory) -and -not (Test-Path -Path $ErrorDirectory)) {
         New-Item -Path $ErrorDirectory -ItemType Directory -Force | Out-Null
     }
 
@@ -251,7 +251,7 @@ function Get-PrimarySmtpFromAddresses {
     $allAddresses = $ProxyAddresses | ForEach-Object {
         $_.ToString().Trim()
     } | Where-Object {
-        -not :IsNullOrWhiteSpace($_)
+        -not [string]::IsNullOrWhiteSpace($_)
     }
 
     $primary = $allAddresses | Where-Object {
@@ -348,7 +348,7 @@ function Invoke-UsersAndContactsFileCleanup {
         -Title "Select users and contacts input CSV file" `
         -Filter "CSV files (*.csv)|*.csv|All files (*.*)|*.*"
 
-    if (:IsNullOrWhiteSpace($script:InputPath)) {
+    if ([string]::IsNullOrWhiteSpace($script:InputPath)) {
         Write-Host "No input path was selected." -ForegroundColor Red
         return
     }
@@ -368,13 +368,13 @@ function Invoke-UsersAndContactsFileCleanup {
             $identity = $r.Identity
             $recipientType = $r.RecipientType
 
-            if (:IsNullOrWhiteSpace($identity)) {
+            if ([string]::IsNullOrWhiteSpace($identity)) {
                 Write-Host "WARNING: CSV row missing Identity value." -ForegroundColor Red
                 Add-ErrorRecord -RecipientType "N/A" -Identity "N/A" -Reason "Missing Identity" -Details "A CSV row did not contain an Identity value."
                 continue
             }
 
-            if (:IsNullOrWhiteSpace($recipientType)) {
+            if ([string]::IsNullOrWhiteSpace($recipientType)) {
                 Write-Host "WARNING: CSV row missing RecipientType value for $identity." -ForegroundColor Red
                 Add-ErrorRecord -RecipientType "N/A" -Identity $identity -Reason "Missing RecipientType" -Details "RecipientType must be MailUser or MailContact."
                 continue
@@ -383,7 +383,7 @@ function Invoke-UsersAndContactsFileCleanup {
             $proxyAddresses = $r."Proxy Addresses" -split '[;,`r`n]+' | ForEach-Object {
                 $_.Trim()
             } | Where-Object {
-                -not :IsNullOrWhiteSpace($_)
+                -not [string]::IsNullOrWhiteSpace($_)
             }
 
             switch ($recipientType) {
@@ -416,14 +416,14 @@ function New-ExampleCsv {
         -Filter "CSV files (*.csv)|*.csv|All files (*.*)|*.*" `
         -DefaultFileName "MailRecipientExample.csv"
 
-    if (:IsNullOrWhiteSpace($ExamplePath)) {
+    if ([string]::IsNullOrWhiteSpace($ExamplePath)) {
         Write-Host "No output path was selected." -ForegroundColor Red
         return
     }
 
     $ExampleDirectory = Split-Path -Path $ExamplePath -Parent
 
-    if (-not :IsNullOrWhiteSpace($ExampleDirectory) -and -not (Test-Path -Path $ExampleDirectory)) {
+    if (-not [string]::IsNullOrWhiteSpace($ExampleDirectory) -and -not (Test-Path -Path $ExampleDirectory)) {
         New-Item -Path $ExampleDirectory -ItemType Directory -Force | Out-Null
     }
 
@@ -478,7 +478,7 @@ function Show-UsersAndContactsFixMenu {
 
                 $Identity = Read-Host "Enter the mail user identity, alias, SMTP address, or distinguished name"
 
-                if (:IsNullOrWhiteSpace($Identity)) {
+                if ([string]::IsNullOrWhiteSpace($Identity)) {
                     Write-Host "No identity was entered." -ForegroundColor Red
                 }
                 else {
@@ -493,7 +493,7 @@ function Show-UsersAndContactsFixMenu {
 
                 $Identity = Read-Host "Enter the mail contact identity, alias, SMTP address, or distinguished name"
 
-                if (:IsNullOrWhiteSpace($Identity)) {
+                if ([string]::IsNullOrWhiteSpace($Identity)) {
                     Write-Host "No identity was entered." -ForegroundColor Red
                 }
                 else {
@@ -574,7 +574,7 @@ function Show-OutputLogMenu {
                     -Filter "Log files (*.log)|*.log|Text files (*.txt)|*.txt|All files (*.*)|*.*" `
                     -DefaultFileName "MailRecipientCleanup.log"
 
-                if (:IsNullOrWhiteSpace($script:TranscriptPath)) {
+                if ([string]::IsNullOrWhiteSpace($script:TranscriptPath)) {
                     Write-Host "No transcript path was selected." -ForegroundColor Red
                 }
                 else {
@@ -631,7 +631,7 @@ function Show-ErrorListMenu {
                     -Filter "CSV files (*.csv)|*.csv|All files (*.*)|*.*" `
                     -DefaultFileName "MailRecipientErrors.csv"
 
-                if (:IsNullOrWhiteSpace($script:ErrorListPath)) {
+                if ([string]::IsNullOrWhiteSpace($script:ErrorListPath)) {
                     Write-Host "No error list path was selected." -ForegroundColor Red
                 }
                 else {
