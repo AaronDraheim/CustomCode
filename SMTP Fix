@@ -5,11 +5,10 @@ The sample scripts are provided AS IS without warranty of any kind. Microsoft fu
 including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
 The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
 In no event shall Microsoft, its authors, or anyone else involved in the creation, production, or delivery of the scripts
-be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption,
-loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
+be liable for any damages whatsoever, including, without limitation, damages for loss of business profits, business interruption,
+loss of business information, or other pecuniary loss, arising out of the use of or inability to use the sample scripts or
 documentation, even if Microsoft has been advised of the possibility of such damages.
 #>
-
 
 [CmdletBinding()]
 param (
@@ -192,13 +191,7 @@ function Invoke-MailContactCleanup {
     }
 }
 
-function Invoke-RecipientFileCleanup {
-    param (
-        [Parameter(Mandatory)]
-        [ValidateSet("MailUser", "MailContact")]
-        [string]$RecipientType
-    )
-
+function Invoke-UsersAndContactsFileCleanup {
     Start-LogIfConfigured
 
     $script:InputPath = Read-Host "Enter the full path to the input CSV file"
@@ -210,21 +203,28 @@ function Invoke-RecipientFileCleanup {
 
     if (-not (Test-Path -Path $script:InputPath)) {
         Write-Host "Input CSV file was not found at path: $script:InputPath" -ForegroundColor Red
-        Add-ErrorRecord -RecipientType $RecipientType -Identity "N/A" -Reason "Input file not found" -Details $script:InputPath
+        Add-ErrorRecord -RecipientType "N/A" -Identity "N/A" -Reason "Input file not found" -Details $script:InputPath
         return
     }
 
     try {
-        Write-Host "Collecting $RecipientType objects from: $script:InputPath" -ForegroundColor Cyan
+        Write-Host "Collecting mail users and mail contacts from: $script:InputPath" -ForegroundColor Cyan
 
         $recipients = Import-Csv -Path $script:InputPath
 
         foreach ($r in $recipients) {
             $identity = $r.Identity
+            $recipientType = $r.RecipientType
 
             if ([string]::IsNullOrWhiteSpace($identity)) {
                 Write-Host "WARNING: CSV row missing Identity value." -ForegroundColor Red
-                Add-ErrorRecord -RecipientType $RecipientType -Identity "N/A" -Reason "Missing Identity" -Details "A CSV row did not contain an Identity value."
+                Add-ErrorRecord -RecipientType "N/A" -Identity "N/A" -Reason "Missing Identity" -Details "A CSV row did not contain an Identity value."
+                continue
+            }
+
+            if ([string]::IsNullOrWhiteSpace($recipientType)) {
+                Write-Host "WARNING: CSV row missing RecipientType value for $identity." -ForegroundColor Red
+                Add-ErrorRecord -RecipientType "N/A" -Identity $identity -Reason "Missing RecipientType" -Details "RecipientType must be MailUser or MailContact."
                 continue
             }
 
@@ -234,7 +234,7 @@ function Invoke-RecipientFileCleanup {
                 -not [string]::IsNullOrWhiteSpace($_)
             }
 
-            switch ($RecipientType) {
+            switch ($recipientType) {
                 "MailUser" {
                     Invoke-MailUserCleanup -Identity $identity -ProxyAddresses $proxyAddresses
                 }
@@ -242,14 +242,19 @@ function Invoke-RecipientFileCleanup {
                 "MailContact" {
                     Invoke-MailContactCleanup -Identity $identity -ProxyAddresses $proxyAddresses
                 }
+
+                default {
+                    Write-Host "WARNING: Unsupported RecipientType '$recipientType' for $identity. Use MailUser or MailContact." -ForegroundColor Red
+                    Add-ErrorRecord -RecipientType $recipientType -Identity $identity -Reason "Unsupported RecipientType" -Details "RecipientType must be MailUser or MailContact."
+                }
             }
         }
 
-        Write-Host "Completed processing $RecipientType input file." -ForegroundColor Green
+        Write-Host "Completed processing users and contacts input file." -ForegroundColor Green
     }
     catch {
         Write-Host "ERROR: Failed to process input file. $($_.Exception.Message)" -ForegroundColor Red
-        Add-ErrorRecord -RecipientType $RecipientType -Identity "N/A" -Reason "Input file processing failed" -Details $_.Exception.Message
+        Add-ErrorRecord -RecipientType "N/A" -Identity "N/A" -Reason "Input file processing failed" -Details $_.Exception.Message
     }
 }
 
@@ -289,24 +294,24 @@ function Show-MainMenu {
     Write-Host "Mail Recipient Primary SMTP Cleanup" -ForegroundColor Cyan
     Write-Host "===================================" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "0. Users fix - select specific user"
-    Write-Host "1. Contacts fix - select specific contact"
-    Write-Host "2. Users fix - select user file"
-    Write-Host "3. Contacts fix - select contacts file"
-    Write-Host "4. Generate example Excel-readable CSV"
-    Write-Host "5. Generate output log"
-    Write-Host "6. Generate errors list"
+    Write-Host "0. Users and Contacts Fix"
+    Write-Host "1. Generate example Excel-readable CSV"
+    Write-Host "2. Generate output log"
+    Write-Host "3. Generate errors list"
     Write-Host "Q. Quit"
     Write-Host ""
 }
 
-function Show-SpecificUserFixMenu {
+function Show-UsersAndContactsFixMenu {
     do {
         Clear-Host
-        Write-Host "0. Users Fix - Specific User" -ForegroundColor Cyan
-        Write-Host "============================" -ForegroundColor Cyan
+
+        Write-Host "0. Users and Contacts Fix" -ForegroundColor Cyan
+        Write-Host "=========================" -ForegroundColor Cyan
         Write-Host ""
-        Write-Host "1. Enter mail user identity and run users fix"
+        Write-Host "1. Run fix against a specific mail user"
+        Write-Host "2. Run fix against a specific mail contact"
+        Write-Host "3. Run fix from CSV using RecipientType column"
         Write-Host "R. Return to main menu"
         Write-Host ""
 
@@ -328,33 +333,7 @@ function Show-SpecificUserFixMenu {
                 Read-Host "Press Enter to continue"
             }
 
-            "R" {
-                return
-            }
-
-            default {
-                Write-Host "Invalid selection. Select 1 or R." -ForegroundColor Red
-                Read-Host "Press Enter to continue"
-            }
-        }
-    }
-    while ($true)
-}
-
-function Show-SpecificContactFixMenu {
-    do {
-        Clear-Host
-        Write-Host "1. Contacts Fix - Specific Contact" -ForegroundColor Cyan
-        Write-Host "==================================" -ForegroundColor Cyan
-        Write-Host ""
-        Write-Host "1. Enter mail contact identity and run contacts fix"
-        Write-Host "R. Return to main menu"
-        Write-Host ""
-
-        $selection = Read-Host "Select an option"
-
-        switch ($selection.ToUpper()) {
-            "1" {
+            "2" {
                 Start-LogIfConfigured
 
                 $Identity = Read-Host "Enter the mail contact identity, alias, SMTP address, or distinguished name"
@@ -369,34 +348,8 @@ function Show-SpecificContactFixMenu {
                 Read-Host "Press Enter to continue"
             }
 
-            "R" {
-                return
-            }
-
-            default {
-                Write-Host "Invalid selection. Select 1 or R." -ForegroundColor Red
-                Read-Host "Press Enter to continue"
-            }
-        }
-    }
-    while ($true)
-}
-
-function Show-UserFileFixMenu {
-    do {
-        Clear-Host
-        Write-Host "2. Users Fix - File" -ForegroundColor Cyan
-        Write-Host "===================" -ForegroundColor Cyan
-        Write-Host ""
-        Write-Host "1. Enter CSV file path and run users fix"
-        Write-Host "R. Return to main menu"
-        Write-Host ""
-
-        $selection = Read-Host "Select an option"
-
-        switch ($selection.ToUpper()) {
-            "1" {
-                Invoke-RecipientFileCleanup -RecipientType "MailUser"
+            "3" {
+                Invoke-UsersAndContactsFileCleanup
                 Read-Host "Press Enter to continue"
             }
 
@@ -405,38 +358,7 @@ function Show-UserFileFixMenu {
             }
 
             default {
-                Write-Host "Invalid selection. Select 1 or R." -ForegroundColor Red
-                Read-Host "Press Enter to continue"
-            }
-        }
-    }
-    while ($true)
-}
-
-function Show-ContactFileFixMenu {
-    do {
-        Clear-Host
-        Write-Host "3. Contacts Fix - File" -ForegroundColor Cyan
-        Write-Host "======================" -ForegroundColor Cyan
-        Write-Host ""
-        Write-Host "1. Enter CSV file path and run contacts fix"
-        Write-Host "R. Return to main menu"
-        Write-Host ""
-
-        $selection = Read-Host "Select an option"
-
-        switch ($selection.ToUpper()) {
-            "1" {
-                Invoke-RecipientFileCleanup -RecipientType "MailContact"
-                Read-Host "Press Enter to continue"
-            }
-
-            "R" {
-                return
-            }
-
-            default {
-                Write-Host "Invalid selection. Select 1 or R." -ForegroundColor Red
+                Write-Host "Invalid selection. Select 1, 2, 3, or R." -ForegroundColor Red
                 Read-Host "Press Enter to continue"
             }
         }
@@ -447,7 +369,8 @@ function Show-ContactFileFixMenu {
 function Show-ExampleFileMenu {
     do {
         Clear-Host
-        Write-Host "4. Generate Example Excel-readable CSV" -ForegroundColor Cyan
+
+        Write-Host "1. Generate Example Excel-readable CSV" -ForegroundColor Cyan
         Write-Host "======================================" -ForegroundColor Cyan
         Write-Host ""
         Write-Host "1. Generate example CSV"
@@ -478,7 +401,8 @@ function Show-ExampleFileMenu {
 function Show-OutputLogMenu {
     do {
         Clear-Host
-        Write-Host "5. Generate Output Log" -ForegroundColor Cyan
+
+        Write-Host "2. Generate Output Log" -ForegroundColor Cyan
         Write-Host "======================" -ForegroundColor Cyan
         Write-Host ""
         Write-Host "1. Set transcript log path"
@@ -531,7 +455,8 @@ function Show-OutputLogMenu {
 function Show-ErrorListMenu {
     do {
         Clear-Host
-        Write-Host "6. Generate Errors List" -ForegroundColor Cyan
+
+        Write-Host "3. Generate Errors List" -ForegroundColor Cyan
         Write-Host "=======================" -ForegroundColor Cyan
         Write-Host ""
         Write-Host "1. Set error list CSV path"
@@ -580,30 +505,18 @@ do {
 
     switch ($selection.ToUpper()) {
         "0" {
-            Show-SpecificUserFixMenu
+            Show-UsersAndContactsFixMenu
         }
 
         "1" {
-            Show-SpecificContactFixMenu
-        }
-
-        "2" {
-            Show-UserFileFixMenu
-        }
-
-        "3" {
-            Show-ContactFileFixMenu
-        }
-
-        "4" {
             Show-ExampleFileMenu
         }
 
-        "5" {
+        "2" {
             Show-OutputLogMenu
         }
 
-        "6" {
+        "3" {
             Show-ErrorListMenu
         }
 
@@ -612,7 +525,7 @@ do {
         }
 
         default {
-            Write-Host "Invalid selection. Select 0, 1, 2, 3, 4, 5, 6, or Q." -ForegroundColor Red
+            Write-Host "Invalid selection. Select 0, 1, 2, 3, or Q." -ForegroundColor Red
             Read-Host "Press Enter to return to the main menu"
         }
     }
@@ -622,4 +535,3 @@ while ($selection.ToUpper() -ne "Q")
 if ($script:TranscriptStarted) {
     Stop-Transcript
 }
-``
