@@ -9,17 +9,7 @@ be liable for any damages whatsoever (including, without limitation, damages for
 loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
 documentation, even if Microsoft has been advised of the possibility of such damages.
 #>
-<#
-Disclaimer
-The sample scripts are not supported under any Microsoft standard support program or service.
-The sample scripts are provided AS IS without warranty of any kind. Microsoft further disclaims all implied warranties
-including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
-The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
-In no event shall Microsoft, its authors, or anyone else involved in the creation, production, or delivery of the scripts
-be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption,
-loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
-documentation, even if Microsoft has been advised of the possibility of such damages.
-#>
+
 
 [CmdletBinding()]
 param (
@@ -33,63 +23,132 @@ param (
     [string]$ErrorListPath
 )
 
+$script:InputPath = $InputPath
+$script:TranscriptPath = $TranscriptPath
+$script:ErrorListPath = $ErrorListPath
 $script:Errors = New-Object System.Collections.Generic.List[object]
 $script:TranscriptStarted = $false
 
 function Start-LogIfConfigured {
-    if (-not [string]::IsNullOrWhiteSpace($TranscriptPath) -and -not $script:TranscriptStarted) {
-        $TranscriptDirectory = Split-Path -Path $TranscriptPath -Parent
+    if (-not [string]::IsNullOrWhiteSpace($script:TranscriptPath) -and -not $script:TranscriptStarted) {
+        $TranscriptDirectory = Split-Path -Path $script:TranscriptPath -Parent
 
         if (-not [string]::IsNullOrWhiteSpace($TranscriptDirectory) -and -not (Test-Path -Path $TranscriptDirectory)) {
             New-Item -Path $TranscriptDirectory -ItemType Directory -Force | Out-Null
         }
 
-        Start-Transcript -Path $TranscriptPath -Append
+        Start-Transcript -Path $script:TranscriptPath -Append
         $script:TranscriptStarted = $true
     }
 }
 
 function Add-ErrorRecord {
     param (
+        [string]$RecipientType,
         [string]$Identity,
         [string]$Reason,
         [string]$Details
     )
 
     $script:Errors.Add([pscustomobject]@{
-        Timestamp = Get-Date
-        Identity  = $Identity
-        Reason    = $Reason
-        Details   = $Details
+        Timestamp     = Get-Date
+        RecipientType = $RecipientType
+        Identity      = $Identity
+        Reason        = $Reason
+        Details       = $Details
     })
 }
 
 function Export-ErrorList {
-    if ([string]::IsNullOrWhiteSpace($ErrorListPath)) {
-        $ErrorListPath = Read-Host "Enter the full path where the error list CSV should be saved, for example C:\Temp\MailContactErrors.csv"
+    if ([string]::IsNullOrWhiteSpace($script:ErrorListPath)) {
+        $script:ErrorListPath = Read-Host "Enter the full path where the error list CSV should be saved, for example C:\Temp\MailRecipientErrors.csv"
     }
 
-    $ErrorDirectory = Split-Path -Path $ErrorListPath -Parent
+    if ([string]::IsNullOrWhiteSpace($script:ErrorListPath)) {
+        Write-Host "No error list path was entered." -ForegroundColor Red
+        return
+    }
+
+    $ErrorDirectory = Split-Path -Path $script:ErrorListPath -Parent
 
     if (-not [string]::IsNullOrWhiteSpace($ErrorDirectory) -and -not (Test-Path -Path $ErrorDirectory)) {
         New-Item -Path $ErrorDirectory -ItemType Directory -Force | Out-Null
     }
 
     if ($script:Errors.Count -gt 0) {
-        $script:Errors | Export-Csv -Path $ErrorListPath -NoTypeInformation -Encoding UTF8
-        Write-Host "Error list exported to: $ErrorListPath" -ForegroundColor Green
+        $script:Errors | Export-Csv -Path $script:ErrorListPath -NoTypeInformation -Encoding UTF8
+        Write-Host "Error list exported to: $script:ErrorListPath" -ForegroundColor Green
     }
     else {
         @(
             [pscustomobject]@{
-                Timestamp = Get-Date
-                Identity  = "N/A"
-                Reason    = "No errors recorded"
-                Details   = "No failures or warnings were captured during this run."
+                Timestamp     = Get-Date
+                RecipientType = "N/A"
+                Identity      = "N/A"
+                Reason        = "No errors recorded"
+                Details       = "No failures or warnings were captured during this run."
             }
-        ) | Export-Csv -Path $ErrorListPath -NoTypeInformation -Encoding UTF8
+        ) | Export-Csv -Path $script:ErrorListPath -NoTypeInformation -Encoding UTF8
 
-        Write-Host "No errors were recorded. Empty error report exported to: $ErrorListPath" -ForegroundColor Green
+        Write-Host "No errors were recorded. Empty error report exported to: $script:ErrorListPath" -ForegroundColor Green
+    }
+}
+
+function Get-PrimarySmtpFromAddresses {
+    param (
+        [string[]]$ProxyAddresses
+    )
+
+    $allAddresses = $ProxyAddresses | ForEach-Object {
+        $_.ToString().Trim()
+    } | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_)
+    }
+
+    $primary = $allAddresses | Where-Object {
+        $_ -cmatch '^SMTP:'
+    } | Select-Object -First 1
+
+    return $primary
+}
+
+function Invoke-MailUserCleanup {
+    param (
+        [Parameter(Mandatory)]
+        [string]$Identity,
+
+        [string[]]$ProxyAddresses
+    )
+
+    try {
+        Write-Host "Processing mail user: $Identity" -ForegroundColor Yellow
+
+        if (-not $ProxyAddresses -or $ProxyAddresses.Count -eq 0) {
+            Write-Host "No proxy addresses provided from CSV. Reading mail user from Exchange Online..." -ForegroundColor Cyan
+
+            $mailUser = Get-MailUser -Identity $Identity -ErrorAction Stop
+            $ProxyAddresses = $mailUser.EmailAddresses
+        }
+
+        $primary = Get-PrimarySmtpFromAddresses -ProxyAddresses $ProxyAddresses
+
+        if ($primary) {
+            Write-Host "Primary SMTP address detected as: $primary" -ForegroundColor Cyan
+
+            Set-MailUser -Identity $Identity -EmailAddressPolicyEnabled $false -ErrorAction Stop
+            Set-MailUser -Identity $Identity -EmailAddresses $primary -ErrorAction Stop
+
+            Write-Host "Updated mail user: $Identity" -ForegroundColor Green
+        }
+        else {
+            $warning = "No primary SMTP address with uppercase SMTP: was found."
+            Write-Host "WARNING: $warning Mail user: $Identity" -ForegroundColor Red
+            Add-ErrorRecord -RecipientType "MailUser" -Identity $Identity -Reason "Primary SMTP not found" -Details $warning
+        }
+    }
+    catch {
+        Write-Host "ERROR: Failed to process mail user $Identity. $($_.Exception.Message)" -ForegroundColor Red
+        Add-ErrorRecord -RecipientType "MailUser" -Identity $Identity -Reason "Processing failed" -Details $_.Exception.Message
     }
 }
 
@@ -102,24 +161,16 @@ function Invoke-MailContactCleanup {
     )
 
     try {
-        Write-Host "Processing contact: $Identity" -ForegroundColor Yellow
+        Write-Host "Processing mail contact: $Identity" -ForegroundColor Yellow
 
         if (-not $ProxyAddresses -or $ProxyAddresses.Count -eq 0) {
-            Write-Host "No proxy addresses provided from CSV. Reading contact from Exchange Online..." -ForegroundColor Cyan
+            Write-Host "No proxy addresses provided from CSV. Reading mail contact from Exchange Online..." -ForegroundColor Cyan
 
             $mailContact = Get-MailContact -Identity $Identity -ErrorAction Stop
             $ProxyAddresses = $mailContact.EmailAddresses
         }
 
-        $allAddresses = $ProxyAddresses | ForEach-Object {
-            $_.ToString().Trim()
-        } | Where-Object {
-            -not [string]::IsNullOrWhiteSpace($_)
-        }
-
-        $primary = $allAddresses | Where-Object {
-            $_ -cmatch '^SMTP:'
-        } | Select-Object -First 1
+        $primary = Get-PrimarySmtpFromAddresses -ProxyAddresses $ProxyAddresses
 
         if ($primary) {
             Write-Host "Primary SMTP address detected as: $primary" -ForegroundColor Cyan
@@ -131,75 +182,79 @@ function Invoke-MailContactCleanup {
         }
         else {
             $warning = "No primary SMTP address with uppercase SMTP: was found."
-            Write-Host "WARNING: $warning Contact: $Identity" -ForegroundColor Red
-            Add-ErrorRecord -Identity $Identity -Reason "Primary SMTP not found" -Details $warning
+            Write-Host "WARNING: $warning Mail contact: $Identity" -ForegroundColor Red
+            Add-ErrorRecord -RecipientType "MailContact" -Identity $Identity -Reason "Primary SMTP not found" -Details $warning
         }
     }
     catch {
-        Write-Host "ERROR: Failed to process $Identity. $($_.Exception.Message)" -ForegroundColor Red
-        Add-ErrorRecord -Identity $Identity -Reason "Processing failed" -Details $_.Exception.Message
+        Write-Host "ERROR: Failed to process mail contact $Identity. $($_.Exception.Message)" -ForegroundColor Red
+        Add-ErrorRecord -RecipientType "MailContact" -Identity $Identity -Reason "Processing failed" -Details $_.Exception.Message
     }
 }
 
-function Invoke-SpecificUser {
+function Invoke-RecipientFileCleanup {
+    param (
+        [Parameter(Mandatory)]
+        [ValidateSet("MailUser", "MailContact")]
+        [string]$RecipientType
+    )
+
     Start-LogIfConfigured
 
-    $Identity = Read-Host "Enter the mail contact identity, alias, SMTP address, or distinguished name"
+    $script:InputPath = Read-Host "Enter the full path to the input CSV file"
 
-    if ([string]::IsNullOrWhiteSpace($Identity)) {
-        Write-Host "No identity was entered." -ForegroundColor Red
+    if ([string]::IsNullOrWhiteSpace($script:InputPath)) {
+        Write-Host "No input path was entered." -ForegroundColor Red
         return
     }
 
-    Invoke-MailContactCleanup -Identity $Identity
-}
-
-function Invoke-UserFile {
-    Start-LogIfConfigured
-
-    if ([string]::IsNullOrWhiteSpace($InputPath)) {
-        $InputPath = Read-Host "Enter the full path to the input CSV file"
-    }
-
-    if (-not (Test-Path -Path $InputPath)) {
-        Write-Host "Input CSV file was not found at path: $InputPath" -ForegroundColor Red
-        Add-ErrorRecord -Identity "N/A" -Reason "Input file not found" -Details $InputPath
+    if (-not (Test-Path -Path $script:InputPath)) {
+        Write-Host "Input CSV file was not found at path: $script:InputPath" -ForegroundColor Red
+        Add-ErrorRecord -RecipientType $RecipientType -Identity "N/A" -Reason "Input file not found" -Details $script:InputPath
         return
     }
 
     try {
-        Write-Host "Collecting mail contacts from: $InputPath" -ForegroundColor Cyan
+        Write-Host "Collecting $RecipientType objects from: $script:InputPath" -ForegroundColor Cyan
 
-        $contacts = Import-Csv -Path $InputPath
+        $recipients = Import-Csv -Path $script:InputPath
 
-        foreach ($c in $contacts) {
-            $identity = $c.Identity
+        foreach ($r in $recipients) {
+            $identity = $r.Identity
 
             if ([string]::IsNullOrWhiteSpace($identity)) {
                 Write-Host "WARNING: CSV row missing Identity value." -ForegroundColor Red
-                Add-ErrorRecord -Identity "N/A" -Reason "Missing Identity" -Details "A CSV row did not contain an Identity value."
+                Add-ErrorRecord -RecipientType $RecipientType -Identity "N/A" -Reason "Missing Identity" -Details "A CSV row did not contain an Identity value."
                 continue
             }
 
-            $proxyAddresses = $c."Proxy Addresses" -split '[;,`r`n]+' | ForEach-Object {
+            $proxyAddresses = $r."Proxy Addresses" -split '[;,`r`n]+' | ForEach-Object {
                 $_.Trim()
             } | Where-Object {
                 -not [string]::IsNullOrWhiteSpace($_)
             }
 
-            Invoke-MailContactCleanup -Identity $identity -ProxyAddresses $proxyAddresses
+            switch ($RecipientType) {
+                "MailUser" {
+                    Invoke-MailUserCleanup -Identity $identity -ProxyAddresses $proxyAddresses
+                }
+
+                "MailContact" {
+                    Invoke-MailContactCleanup -Identity $identity -ProxyAddresses $proxyAddresses
+                }
+            }
         }
 
-        Write-Host "Completed processing input file." -ForegroundColor Green
+        Write-Host "Completed processing $RecipientType input file." -ForegroundColor Green
     }
     catch {
         Write-Host "ERROR: Failed to process input file. $($_.Exception.Message)" -ForegroundColor Red
-        Add-ErrorRecord -Identity "N/A" -Reason "Input file processing failed" -Details $_.Exception.Message
+        Add-ErrorRecord -RecipientType $RecipientType -Identity "N/A" -Reason "Input file processing failed" -Details $_.Exception.Message
     }
 }
 
 function New-ExampleCsv {
-    $ExamplePath = Read-Host "Enter the full path where the example CSV should be created, for example C:\Temp\MailContactExample.csv"
+    $ExamplePath = Read-Host "Enter the full path where the example CSV should be created, for example C:\Temp\MailRecipientExample.csv"
 
     if ([string]::IsNullOrWhiteSpace($ExamplePath)) {
         Write-Host "No output path was entered." -ForegroundColor Red
@@ -214,54 +269,308 @@ function New-ExampleCsv {
 
     @(
         [pscustomobject]@{
-            Identity          = "contact1@contoso.com"
-            "Proxy Addresses" = "SMTP:contact1@contoso.com;smtp:alias1@contoso.com;smtp:oldalias1@contoso.com"
+            Identity          = "mailuser1@contoso.com"
+            "Proxy Addresses" = "SMTP:mailuser1@contoso.com;smtp:alias1@contoso.com;smtp:oldalias1@contoso.com"
+            RecipientType     = "MailUser"
         },
         [pscustomobject]@{
-            Identity          = "contact2@contoso.com"
-            "Proxy Addresses" = "SMTP:contact2@contoso.com;smtp:alias2@contoso.com"
+            Identity          = "contact1@contoso.com"
+            "Proxy Addresses" = "SMTP:contact1@contoso.com;smtp:alias2@contoso.com;smtp:oldalias2@contoso.com"
+            RecipientType     = "MailContact"
         }
     ) | Export-Csv -Path $ExamplePath -NoTypeInformation -Encoding UTF8
 
-    Write-Host "Example CSV created at: $ExamplePath" -ForegroundColor Green
-    Write-Host "Open the CSV in Excel if you need to review or edit it in spreadsheet format." -ForegroundColor Cyan
-}
-
-function Set-OutputLogPath {
-    $script:TranscriptPath = Read-Host "Enter the full path where the transcript log should be saved, for example C:\Temp\MailContactCleanup.log"
-
-    if ([string]::IsNullOrWhiteSpace($script:TranscriptPath)) {
-        Write-Host "No transcript path was entered." -ForegroundColor Red
-        return
-    }
-
-    Write-Host "Transcript log path set to: $script:TranscriptPath" -ForegroundColor Green
-}
-
-function Set-ErrorListPath {
-    $script:ErrorListPath = Read-Host "Enter the full path where the error list CSV should be saved, for example C:\Temp\MailContactErrors.csv"
-
-    if ([string]::IsNullOrWhiteSpace($script:ErrorListPath)) {
-        Write-Host "No error list path was entered." -ForegroundColor Red
-        return
-    }
-
-    Write-Host "Error list path set to: $script:ErrorListPath" -ForegroundColor Green
+    Write-Host "Example Excel-readable CSV created at: $ExamplePath" -ForegroundColor Green
 }
 
 function Show-MainMenu {
     Clear-Host
 
-    Write-Host "Mail Contact Primary SMTP Cleanup" -ForegroundColor Cyan
-    Write-Host "=================================" -ForegroundColor Cyan
+    Write-Host "Mail Recipient Primary SMTP Cleanup" -ForegroundColor Cyan
+    Write-Host "===================================" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "0. Select specific user to run against"
-    Write-Host "1. Select user file"
-    Write-Host "2. Generate example Excel-readable CSV"
-    Write-Host "3. Generate output log"
-    Write-Host "4. Generate errors list"
+    Write-Host "0. Users fix - select specific user"
+    Write-Host "1. Contacts fix - select specific contact"
+    Write-Host "2. Users fix - select user file"
+    Write-Host "3. Contacts fix - select contacts file"
+    Write-Host "4. Generate example Excel-readable CSV"
+    Write-Host "5. Generate output log"
+    Write-Host "6. Generate errors list"
     Write-Host "Q. Quit"
     Write-Host ""
+}
+
+function Show-SpecificUserFixMenu {
+    do {
+        Clear-Host
+        Write-Host "0. Users Fix - Specific User" -ForegroundColor Cyan
+        Write-Host "============================" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "1. Enter mail user identity and run users fix"
+        Write-Host "R. Return to main menu"
+        Write-Host ""
+
+        $selection = Read-Host "Select an option"
+
+        switch ($selection.ToUpper()) {
+            "1" {
+                Start-LogIfConfigured
+
+                $Identity = Read-Host "Enter the mail user identity, alias, SMTP address, or distinguished name"
+
+                if ([string]::IsNullOrWhiteSpace($Identity)) {
+                    Write-Host "No identity was entered." -ForegroundColor Red
+                }
+                else {
+                    Invoke-MailUserCleanup -Identity $Identity
+                }
+
+                Read-Host "Press Enter to continue"
+            }
+
+            "R" {
+                return
+            }
+
+            default {
+                Write-Host "Invalid selection. Select 1 or R." -ForegroundColor Red
+                Read-Host "Press Enter to continue"
+            }
+        }
+    }
+    while ($true)
+}
+
+function Show-SpecificContactFixMenu {
+    do {
+        Clear-Host
+        Write-Host "1. Contacts Fix - Specific Contact" -ForegroundColor Cyan
+        Write-Host "==================================" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "1. Enter mail contact identity and run contacts fix"
+        Write-Host "R. Return to main menu"
+        Write-Host ""
+
+        $selection = Read-Host "Select an option"
+
+        switch ($selection.ToUpper()) {
+            "1" {
+                Start-LogIfConfigured
+
+                $Identity = Read-Host "Enter the mail contact identity, alias, SMTP address, or distinguished name"
+
+                if ([string]::IsNullOrWhiteSpace($Identity)) {
+                    Write-Host "No identity was entered." -ForegroundColor Red
+                }
+                else {
+                    Invoke-MailContactCleanup -Identity $Identity
+                }
+
+                Read-Host "Press Enter to continue"
+            }
+
+            "R" {
+                return
+            }
+
+            default {
+                Write-Host "Invalid selection. Select 1 or R." -ForegroundColor Red
+                Read-Host "Press Enter to continue"
+            }
+        }
+    }
+    while ($true)
+}
+
+function Show-UserFileFixMenu {
+    do {
+        Clear-Host
+        Write-Host "2. Users Fix - File" -ForegroundColor Cyan
+        Write-Host "===================" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "1. Enter CSV file path and run users fix"
+        Write-Host "R. Return to main menu"
+        Write-Host ""
+
+        $selection = Read-Host "Select an option"
+
+        switch ($selection.ToUpper()) {
+            "1" {
+                Invoke-RecipientFileCleanup -RecipientType "MailUser"
+                Read-Host "Press Enter to continue"
+            }
+
+            "R" {
+                return
+            }
+
+            default {
+                Write-Host "Invalid selection. Select 1 or R." -ForegroundColor Red
+                Read-Host "Press Enter to continue"
+            }
+        }
+    }
+    while ($true)
+}
+
+function Show-ContactFileFixMenu {
+    do {
+        Clear-Host
+        Write-Host "3. Contacts Fix - File" -ForegroundColor Cyan
+        Write-Host "======================" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "1. Enter CSV file path and run contacts fix"
+        Write-Host "R. Return to main menu"
+        Write-Host ""
+
+        $selection = Read-Host "Select an option"
+
+        switch ($selection.ToUpper()) {
+            "1" {
+                Invoke-RecipientFileCleanup -RecipientType "MailContact"
+                Read-Host "Press Enter to continue"
+            }
+
+            "R" {
+                return
+            }
+
+            default {
+                Write-Host "Invalid selection. Select 1 or R." -ForegroundColor Red
+                Read-Host "Press Enter to continue"
+            }
+        }
+    }
+    while ($true)
+}
+
+function Show-ExampleFileMenu {
+    do {
+        Clear-Host
+        Write-Host "4. Generate Example Excel-readable CSV" -ForegroundColor Cyan
+        Write-Host "======================================" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "1. Generate example CSV"
+        Write-Host "R. Return to main menu"
+        Write-Host ""
+
+        $selection = Read-Host "Select an option"
+
+        switch ($selection.ToUpper()) {
+            "1" {
+                New-ExampleCsv
+                Read-Host "Press Enter to continue"
+            }
+
+            "R" {
+                return
+            }
+
+            default {
+                Write-Host "Invalid selection. Select 1 or R." -ForegroundColor Red
+                Read-Host "Press Enter to continue"
+            }
+        }
+    }
+    while ($true)
+}
+
+function Show-OutputLogMenu {
+    do {
+        Clear-Host
+        Write-Host "5. Generate Output Log" -ForegroundColor Cyan
+        Write-Host "======================" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "1. Set transcript log path"
+        Write-Host "2. Start transcript logging"
+        Write-Host "R. Return to main menu"
+        Write-Host ""
+
+        $selection = Read-Host "Select an option"
+
+        switch ($selection.ToUpper()) {
+            "1" {
+                $script:TranscriptPath = Read-Host "Enter the full path where the transcript log should be saved, for example C:\Temp\MailRecipientCleanup.log"
+
+                if ([string]::IsNullOrWhiteSpace($script:TranscriptPath)) {
+                    Write-Host "No transcript path was entered." -ForegroundColor Red
+                }
+                else {
+                    Write-Host "Transcript log path set to: $script:TranscriptPath" -ForegroundColor Green
+                }
+
+                Read-Host "Press Enter to continue"
+            }
+
+            "2" {
+                Start-LogIfConfigured
+
+                if ($script:TranscriptStarted) {
+                    Write-Host "Transcript logging is active." -ForegroundColor Green
+                }
+                else {
+                    Write-Host "Transcript logging was not started. Confirm a transcript path is configured." -ForegroundColor Red
+                }
+
+                Read-Host "Press Enter to continue"
+            }
+
+            "R" {
+                return
+            }
+
+            default {
+                Write-Host "Invalid selection. Select 1, 2, or R." -ForegroundColor Red
+                Read-Host "Press Enter to continue"
+            }
+        }
+    }
+    while ($true)
+}
+
+function Show-ErrorListMenu {
+    do {
+        Clear-Host
+        Write-Host "6. Generate Errors List" -ForegroundColor Cyan
+        Write-Host "=======================" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "1. Set error list CSV path"
+        Write-Host "2. Export current error list"
+        Write-Host "R. Return to main menu"
+        Write-Host ""
+
+        $selection = Read-Host "Select an option"
+
+        switch ($selection.ToUpper()) {
+            "1" {
+                $script:ErrorListPath = Read-Host "Enter the full path where the error list CSV should be saved, for example C:\Temp\MailRecipientErrors.csv"
+
+                if ([string]::IsNullOrWhiteSpace($script:ErrorListPath)) {
+                    Write-Host "No error list path was entered." -ForegroundColor Red
+                }
+                else {
+                    Write-Host "Error list path set to: $script:ErrorListPath" -ForegroundColor Green
+                }
+
+                Read-Host "Press Enter to continue"
+            }
+
+            "2" {
+                Export-ErrorList
+                Read-Host "Press Enter to continue"
+            }
+
+            "R" {
+                return
+            }
+
+            default {
+                Write-Host "Invalid selection. Select 1, 2, or R." -ForegroundColor Red
+                Read-Host "Press Enter to continue"
+            }
+        }
+    }
+    while ($true)
 }
 
 do {
@@ -271,30 +580,31 @@ do {
 
     switch ($selection.ToUpper()) {
         "0" {
-            Invoke-SpecificUser
-            Read-Host "Press Enter to return to the main menu"
+            Show-SpecificUserFixMenu
         }
 
         "1" {
-            Invoke-UserFile
-            Read-Host "Press Enter to return to the main menu"
+            Show-SpecificContactFixMenu
         }
 
         "2" {
-            New-ExampleCsv
-            Read-Host "Press Enter to return to the main menu"
+            Show-UserFileFixMenu
         }
 
         "3" {
-            Set-OutputLogPath
-            Start-LogIfConfigured
-            Read-Host "Press Enter to return to the main menu"
+            Show-ContactFileFixMenu
         }
 
         "4" {
-            Set-ErrorListPath
-            Export-ErrorList
-            Read-Host "Press Enter to return to the main menu"
+            Show-ExampleFileMenu
+        }
+
+        "5" {
+            Show-OutputLogMenu
+        }
+
+        "6" {
+            Show-ErrorListMenu
         }
 
         "Q" {
@@ -302,7 +612,7 @@ do {
         }
 
         default {
-            Write-Host "Invalid selection. Select 0, 1, 2, 3, 4, or Q." -ForegroundColor Red
+            Write-Host "Invalid selection. Select 0, 1, 2, 3, 4, 5, 6, or Q." -ForegroundColor Red
             Read-Host "Press Enter to return to the main menu"
         }
     }
@@ -312,3 +622,4 @@ while ($selection.ToUpper() -ne "Q")
 if ($script:TranscriptStarted) {
     Stop-Transcript
 }
+``
