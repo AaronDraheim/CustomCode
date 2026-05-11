@@ -9,4 +9,45 @@ be liable for any damages whatsoever (including, without limitation, damages for
 loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
 documentation, even if Microsoft has been advised of the possibility of such damages.
 #>
+[CmdletBinding()]
+param (
+    [Parameter()]
+    [string]
+    $inputpath,
+    # Parameter help description
+    [Parameter()]
+    [string]
+    $TranscriptPath
+)
 
+Start-Transcript -Path $TranscriptPath
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+Write-Host "Collecting mail contacts..." -ForegroundColor Cyan
+
+$contacts = Import-csv -Path $inputpath
+
+
+foreach ($c in $contacts) {
+
+    # Capture all existing addresses
+    $allAddresses = $c."Proxy Addresses"
+
+    # Identify primary SMTP (uppercase SMTP:)
+    $primary = $allAddresses | Where-Object { $_ -cmatch '^SMTP:' }
+    Write-Host "Primary SMTP Address detected as $primary"
+    if ($primary) {
+        Write-Host "Processing:" $c.Identity -ForegroundColor Yellow
+
+        # Disable email address policy
+        Set-MailContact -Identity $c.Identity -EmailAddressPolicyEnabled $false
+
+        # Replace all addresses with only the primary
+        Set-MailContact -Identity $c.Identity -EmailAddresses $primary
+    }
+    else {
+        Write-Host "WARNING: No primary SMTP found for" $c.Identity -ForegroundColor Red
+    }
+}
+
+Write-Host "Completed." -ForegroundColor Green
+Stop-Transcript
