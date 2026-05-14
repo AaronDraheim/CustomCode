@@ -1,0 +1,332 @@
+<#
+Disclaimer
+The sample scripts are not supported under any Microsoft standard support program or service.
+The sample scripts are provided AS IS without warranty of any kind. Microsoft further disclaims all implied warranties
+including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
+The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
+In no event shall Microsoft, its authors, or anyone else involved in the creation, production, or delivery of the scripts
+be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption,
+loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
+documentation, even if Microsoft has been advised of the possibility of such damages.
+#>
+<#
+.SYNOPSIS
+    Report Microsoft Entra ID user accounts Sign-In Activity
+.DESCRIPTION
+    Retrieves signInActivity lastSuccessfulSignInDateTime
+    Flags stale candidates and accounts never signed in
+    Outputs CSV report with remediation-ready columns
+.REQUIREMENTS
+    Windows PowerShell 5.1
+    Microsoft.Graph.Authentication v2+
+.PARAMETER StaleDays
+    Days without sign-in before flagged stale. Default: 90
+.PARAMETER ExportPath
+    Full path to output CSV. If omitted console prompt collects.
+.PARAMETER OnlyEnabled
+    If specified only enabled accounts are evaluated.
+#>
+
+[CmdletBinding()]
+param(
+    [int]$StaleDays     = 90,
+    [string]$ExportPath = '',
+    [switch]$OnlyEnabled
+)
+
+$ErrorActionPreference = 'Stop'
+
+#region --- Console Prompt for Export Path ---
+function Get-ExportPathViaPrompt {
+    param(
+        [string]$DefaultFolder   = [System.Environment]::GetFolderPath('Desktop'),
+        [string]$DefaultFileName = ('entra-users-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.csv')
+    )
+
+    $folder = Read-Host "Export folder [default: $DefaultFolder]"
+    if ([string]::IsNullOrWhiteSpace($folder)) { $folder = $DefaultFolder }
+
+    # Force absolute path - resolve relative paths against Desktop
+    if (-not [System.IO.Path]::IsPathRooted($folder)) {
+        $folder = Join-Path -Path ([System.Environment]::GetFolderPath('Desktop')) -ChildPath $folder
+    }
+    $folder = [System.IO.Path]::GetFullPath($folder)
+
+    if (-not (Test-Path -Path $folder)) {
+        $create = Read-Host "Folder does not exist. Create it? [Y/N]"
+        if ($create -match '^[Yy]') {
+            New-Item -ItemType Directory -Path $folder -Force | Out-Null
+            Write-Host "Folder created: $folder" -ForegroundColor Green
+        } else {
+            throw 'Export cancelled.'
+        }
+    }
+
+    $fileName = Read-Host "File name [default: $DefaultFileName]"
+    if ([string]::IsNullOrWhiteSpace($fileName)) { $fileName = $DefaultFileName }
+    if (-not $fileName.ToLowerInvariant().EndsWith('.csv')) { $fileName += '.csv' }
+
+    $fullPath = [System.IO.Path]::GetFullPath((Join-Path -Path $folder -ChildPath $fileName))
+    Write-Host "Export path resolved to: $fullPath" -ForegroundColor Cyan
+    return $fullPath
+}
+#endregion
+
+#region --- Extract lastSuccessfulSignInDateTime as UTC ---
+function Get-LastSuccessfulSignInUtc {
+    param($SignInActivity)
+    if ($null -eq $SignInActivity) { return $null }
+
+    $raw = $null
+    try {
+        if ($SignInActivity -is [System.Collections.Hashtable]) {
+            if ($SignInActivity.ContainsKey('lastSuccessfulSignInDateTime')) {
+                $raw = $SignInActivity['lastSuccessfulSignInDateTime']
+            }
+        } elseif ($SignInActivity -is [System.Collections.Generic.Dictionary[string,object]]) {
+            if ($SignInActivity.ContainsKey('lastSuccessfulSignInDateTime')) {
+                $raw = $SignInActivity['lastSuccessfulSignInDateTime']
+            }
+        } else {
+            $prop = $SignInActivity.PSObject.Properties['lastSuccessfulSignInDateTime']
+            if ($null -ne $prop) { $raw = $prop.Value }
+        }
+    } catch {
+        return $null
+    }
+
+    if ($null -eq $raw -or [string]::IsNullOrWhiteSpace([string]$raw)) { return $null }
+    return ([datetime]::Parse([string]$raw)).ToUniversalTime()
+}
+#endregion
+
+#region --- Safe Property Getter ---
+function Get-Prop {
+    param($Object, [string]$Key)
+    if ($null -eq $Object) { return $null }
+    try {
+        if ($Object -is [System.Collections.Hashtable]) {
+            if ($Object.ContainsKey($Key)) { return $Object[$Key] }
+            return $null
+        }
+        if ($Object -is [System.Collections.Generic.Dictionary[string,object]]) {
+            if ($Object.ContainsKey($Key)) { return $Object[$Key] }
+            return $null
+        }
+        $prop = $Object.PSObject.Properties[$Key]
+        if ($null -ne $prop) { return $prop.Value }
+    } catch {
+        return $null
+    }
+    return $null
+}
+#endregion
+
+#region --- Import Required Module ---
+Write-Host "`nVerifying required modules..." -ForegroundColor Cyan
+if (-not (Get-Module -ListAvailable -Name 'Microsoft.Graph.Authentication')) {
+    Write-Host "Installing Microsoft.Graph.Authentication..." -ForegroundColor Yellow
+    Install-Module -Name 'Microsoft.Graph.Authentication' -Scope CurrentUser -Force -ErrorAction Stop
+}
+Import-Module -Name 'Microsoft.Graph.Authentication' -ErrorAction Stop
+Write-Host "Module loaded: Microsoft.Graph.Authentication" -ForegroundColor Green
+#endregion
+
+#region --- Resolve Export Path ---
+if ([string]::IsNullOrWhiteSpace($ExportPath)) {
+    $ExportPath = Get-ExportPathViaPrompt
+}
+
+# Always force absolute path even if -ExportPath was passed as relative
+if (-not [System.IO.Path]::IsPathRooted($ExportPath)) {
+    $ExportPath = [System.IO.Path]::GetFullPath(
+        (Join-Path -Path ([System.Environment]::GetFolderPath('Desktop')) -ChildPath $ExportPath)
+    )
+}
+
+$exportFolder = Split-Path -Path $ExportPath -Parent
+if (-not (Test-Path -Path $exportFolder)) {
+    Write-Host "Creating export folder: $exportFolder" -ForegroundColor Yellow
+    New-Item -ItemType Directory -Path $exportFolder -Force | Out-Null
+}
+
+Write-Host "Export path confirmed: $ExportPath" -ForegroundColor Cyan
+#endregion
+
+#region --- Connect to Microsoft Graph ---
+$scopes = @('User.Read.All', 'AuditLog.Read.All')
+
+Write-Host "`n=== Microsoft Graph Connection ===" -ForegroundColor Cyan
+
+$currentContext = $null
+try { $currentContext = Get-MgContext -ErrorAction SilentlyContinue } catch { $currentContext = $null }
+
+$scopesOk = $false
+if ($null -ne $currentContext) {
+    $existingScopes = $null
+    try { $existingScopes = $currentContext.Scopes } catch { $existingScopes = $null }
+    if ($null -ne $existingScopes) {
+        $missingScopes = @($scopes | Where-Object { $_ -notin $existingScopes })
+        $scopesOk      = ($missingScopes.Count -eq 0)
+    }
+}
+
+if ($scopesOk) {
+    Write-Host "Already connected as: $($currentContext.Account)" -ForegroundColor Green
+    Write-Host "All required scopes confirmed."                   -ForegroundColor Green
+} else {
+    if ($null -ne $currentContext) {
+        try { Disconnect-MgGraph | Out-Null } catch {}
+        $currentContext = $null
+    }
+    Write-Host "Required Permissions:"                                   -ForegroundColor Cyan
+    Write-Host "  User.Read.All     : user profiles and signInActivity" -ForegroundColor White
+    Write-Host "  AuditLog.Read.All : sign-in activity and audit logs"  -ForegroundColor White
+    Write-Host "Open browser: https://microsoft.com/devicelogin"        -ForegroundColor Yellow
+    Connect-MgGraph -Scopes $scopes -NoWelcome -UseDeviceCode
+}
+
+$currentContext = $null
+try { $currentContext = Get-MgContext -ErrorAction SilentlyContinue } catch { $currentContext = $null }
+if ($null -eq $currentContext) { throw 'Failed to connect to Microsoft Graph.' }
+
+Write-Host "Successfully connected to Microsoft Graph." -ForegroundColor Green
+Write-Host "Account  : $($currentContext.Account)"     -ForegroundColor Green
+Write-Host "TenantId : $($currentContext.TenantId)"    -ForegroundColor Green
+#endregion
+
+#region --- Extract Bearer Token PS 5.1 Safe ---
+Write-Host "`nRetrieving access token..." -ForegroundColor Cyan
+
+$accessToken = $null
+$tmpFile     = $null
+
+try {
+    $tmpFile = [System.IO.Path]::GetTempFileName()
+    Invoke-MgGraphRequest -Method GET `
+        -Uri 'https://graph.microsoft.com/v1.0/me?$select=id' `
+        -OutputFilePath $tmpFile -ErrorAction Stop
+    $accessToken = 'USE_SDK'
+    Write-Host "SDK token context working." -ForegroundColor Green
+} catch {
+    $accessToken = $null
+    Write-Host "SDK token context broken - using manual token prompt." -ForegroundColor Yellow
+} finally {
+    if ($null -ne $tmpFile -and (Test-Path $tmpFile)) { Remove-Item $tmpFile -Force }
+}
+
+if ($null -eq $accessToken) {
+    Write-Host ""                                                                        -ForegroundColor Cyan
+    Write-Host "================================================================"        -ForegroundColor Cyan
+    Write-Host " PS 5.1 + SDK v2 token context broken."                                 -ForegroundColor Yellow
+    Write-Host " Option A - Azure CLI:"                                                  -ForegroundColor White
+    Write-Host "   az login"                                                             -ForegroundColor Green
+    Write-Host "   az account get-access-token --resource https://graph.microsoft.com"  -ForegroundColor Green
+    Write-Host "   Copy the 'accessToken' value and paste below."                       -ForegroundColor White
+    Write-Host " Option B - Graph Explorer:"                                             -ForegroundColor White
+    Write-Host "   https://developer.microsoft.com/graph/graph-explorer"                -ForegroundColor Green
+    Write-Host "   Sign in > F12 > Network > Authorization header"                      -ForegroundColor White
+    Write-Host "   Copy everything AFTER 'Bearer ' and paste below."                    -ForegroundColor White
+    Write-Host "================================================================"        -ForegroundColor Cyan
+
+    $secureToken = Read-Host "Paste Bearer token here" -AsSecureString
+    $bstr        = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+    $accessToken = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+
+    if ([string]::IsNullOrWhiteSpace($accessToken)) { throw 'No token provided. Cannot continue.' }
+    Write-Host "Bearer token received." -ForegroundColor Green
+}
+#endregion
+
+#region --- Query Users via REST ---
+Write-Host "`nRetrieving users from Graph beta endpoint..." -ForegroundColor Cyan
+
+$select  = 'id,displayName,userPrincipalName,accountEnabled,signInActivity'
+$baseUri = "https://graph.microsoft.com/beta/users?`$select=$select&`$top=999"
+if ($OnlyEnabled) { $baseUri += '&$filter=accountEnabled eq true' }
+
+$allUsers = [System.Collections.Generic.List[object]]::new()
+$uri      = $baseUri
+
+do {
+    $resp = $null
+    if ($accessToken -eq 'USE_SDK') {
+        $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop
+    } else {
+        $headers = @{ Authorization = "Bearer $accessToken" }
+        $resp    = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -ErrorAction Stop
+    }
+
+    $values = Get-Prop -Object $resp -Key 'value'
+    if ($null -ne $values) {
+        foreach ($u in $values) { $allUsers.Add($u) }
+    }
+    $uri = Get-Prop -Object $resp -Key '@odata.nextLink'
+
+} while (-not [string]::IsNullOrWhiteSpace($uri))
+
+Write-Host "Total users retrieved: $($allUsers.Count)" -ForegroundColor Cyan
+#endregion
+
+#region --- Build Report ---
+Write-Host "`nBuilding report..." -ForegroundColor Cyan
+
+$cutoffUtc  = (Get-Date).ToUniversalTime().AddDays(-$StaleDays)
+$reportList = [System.Collections.Generic.List[object]]::new()
+
+foreach ($u in $allUsers) {
+    $dn             = Get-Prop -Object $u -Key 'displayName'
+    $upn            = Get-Prop -Object $u -Key 'userPrincipalName'
+    $rawEnabled     = Get-Prop -Object $u -Key 'accountEnabled'
+    $accountEnabled = if ($null -ne $rawEnabled) { [bool]$rawEnabled } else { $false }
+    $signInActivity = Get-Prop -Object $u -Key 'signInActivity'
+    $lastUtc        = Get-LastSuccessfulSignInUtc -SignInActivity $signInActivity
+
+    $reportList.Add([PSCustomObject]@{
+        DisplayName                     = if ($null -ne $dn)  { [string]$dn }  else { '' }
+        UserPrincipalName               = if ($null -ne $upn) { [string]$upn } else { '' }
+        AccountEnabled                  = $accountEnabled
+        LastSuccessfulSignInDateTimeUtc = if ($null -ne $lastUtc) { $lastUtc.ToString('yyyy-MM-dd HH:mm:ss') } else { 'Never' }
+        StaleCutoffUtc                  = $cutoffUtc.ToString('yyyy-MM-dd HH:mm:ss')
+        IsStale                         = ($null -ne $lastUtc -and $lastUtc -lt $cutoffUtc)
+        NeedsInvestigation              = ($null -eq $lastUtc)
+    })
+}
+
+Write-Host "Report rows built: $($reportList.Count)" -ForegroundColor Cyan
+#endregion
+
+#region --- Sort and Export ---
+Write-Host "`nSorting and exporting..." -ForegroundColor Cyan
+
+$sorted = $reportList | Sort-Object -Property @(
+    @{ Expression = 'IsStale';            Descending = $true  },
+    @{ Expression = 'NeedsInvestigation'; Descending = $true  },
+    @{ Expression = 'UserPrincipalName';  Descending = $false }
+)
+
+try {
+    $sorted | Export-Csv -NoTypeInformation -Path $ExportPath -Encoding UTF8 -Force
+    Write-Host "Export-Csv completed." -ForegroundColor Green
+} catch {
+    Write-Host "Export-Csv failed: $_" -ForegroundColor Red
+    $ExportPath = Join-Path -Path ([System.Environment]::GetFolderPath('Desktop')) `
+                            -ChildPath ('entra-report-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.csv')
+    Write-Host "Attempting fallback export to: $ExportPath" -ForegroundColor Yellow
+    $sorted | Export-Csv -NoTypeInformation -Path $ExportPath -Encoding UTF8 -Force
+}
+
+if (Test-Path -Path $ExportPath) {
+    $count = ($sorted | Measure-Object).Count
+    Write-Host "Report exported to : $ExportPath" -ForegroundColor Green
+    Write-Host "Total rows         : $count"      -ForegroundColor Green
+} else {
+    Write-Host "ERROR: File not found after export: $ExportPath" -ForegroundColor Red
+}
+#endregion
+
+#region --- Disconnect ---
+try { Disconnect-MgGraph | Out-Null } catch {}
+#endregion 
+
