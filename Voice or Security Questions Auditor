@@ -7,7 +7,6 @@ In no event shall Microsoft, its authors, or anyone else involved in the creatio
 be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption,
 loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
 documentation, even if Microsoft has been advised of the possibility of such damages. #>
-
 Import-Module Microsoft.Graph.Identity.SignIns
 Import-Module Microsoft.Graph.Users
 
@@ -18,27 +17,34 @@ Connect-MgGraph -Scopes @(
 
 # --- Output path ---
 $timestamp  = Get-Date -Format 'yyyyMMdd_HHmm'
-$reportPath = "C:\PhoneAuth_Report_$timestamp.csv"
+$reportPath = "C:\AuthMethods_Audit_$timestamp.txt"
 
 # --- Collection ---
 $results = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-Write-Host "`n===== DISCOVERY (NO CONVERSION) =====" -ForegroundColor Cyan
-Write-Host "Retrieving all users..." -ForegroundColor Cyan
+Write-Host "`n===== AUTH METHODS AUDIT =====" -ForegroundColor Cyan
+Write-Host "Retrieving users..." -ForegroundColor Cyan
 
-# Include Mail property
 $users   = Get-MgUser -All -Property Id,DisplayName,UserPrincipalName,Mail,Department,JobTitle
 $total   = $users.Count
 $counter = 0
 
 foreach ($user in $users) {
     $counter++
-    Write-Progress -Activity "Discovering phone auth methods" `
+    Write-Progress -Activity "Auditing authentication methods" `
                    -Status "$counter of $total — $($user.UserPrincipalName)" `
                    -PercentComplete (($counter / $total) * 100)
 
     try {
-        $phoneMethods = Get-MgUserAuthenticationPhoneMethod -UserId $user.Id -ErrorAction Stop
+        # --- Phone Methods ---
+        $phoneMethods = Get-MgUserAuthenticationPhoneMethod -UserId $user.Id -ErrorAction SilentlyContinue
+
+        # --- Security Questions (SSPR) ---
+        # Graph method for security questions
+        $securityQuestions = Get-MgUserAuthenticationMethod -UserId $user.Id -ErrorAction SilentlyContinue |
+                             Where-Object { $_.'@odata.type' -eq "#microsoft.graph.securityQuestionAuthenticationMethod" }
+
+        $hasSecurityQuestions = if ($securityQuestions) { "Yes" } else { "No" }
 
         if (-not $phoneMethods) {
             $results.Add([PSCustomObject]@{
@@ -50,26 +56,26 @@ foreach ($user in $users) {
                 PhoneType        = "None"
                 PhoneNumber      = "N/A"
                 SMSCapable       = "No"
-                VoiceCapable     = "No"
+                SecurityQuestionsRegistered = $hasSecurityQuestions
             })
-            continue
         }
+        else {
+            foreach ($method in $phoneMethods) {
+                $phoneType = $method.PhoneType
+                $smsCapable = $phoneType -in @("mobile", "alternateMobile")
 
-        foreach ($method in $phoneMethods) {
-            $phoneType = $method.PhoneType
-            $smsCapable = $phoneType -in @("mobile", "alternateMobile")
-
-            $results.Add([PSCustomObject]@{
-                UserPrincipalName = $user.UserPrincipalName
-                Email            = $user.Mail
-                DisplayName      = $user.DisplayName
-                Department       = $user.Department
-                JobTitle         = $user.JobTitle
-                PhoneType        = $phoneType
-                PhoneNumber      = $method.PhoneNumber
-                SMSCapable       = if ($smsCapable) { "Yes" } else { "No" }
-                VoiceCapable     = "Yes"
-            })
+                $results.Add([PSCustomObject]@{
+                    UserPrincipalName = $user.UserPrincipalName
+                    Email            = $user.Mail
+                    DisplayName      = $user.DisplayName
+                    Department       = $user.Department
+                    JobTitle         = $user.JobTitle
+                    PhoneType        = $phoneType
+                    PhoneNumber      = $method.PhoneNumber
+                    SMSCapable       = if ($smsCapable) { "Yes" } else { "No" }
+                    SecurityQuestionsRegistered = $hasSecurityQuestions
+                })
+            }
         }
     }
     catch {
@@ -82,24 +88,24 @@ foreach ($user in $users) {
             PhoneType        = "ERROR"
             PhoneNumber      = "N/A"
             SMSCapable       = "N/A"
-            VoiceCapable     = "N/A"
+            SecurityQuestionsRegistered = "Unknown"
         })
     }
 }
 
-Write-Progress -Activity "Discovering phone auth methods" -Completed
+Write-Progress -Activity "Auditing authentication methods" -Completed
 
 # --- Sort results ---
 $sortedResults = $results | Sort-Object UserPrincipalName
 
-# --- Top 10 to console ---
+# --- Top 10 ---
 Write-Host "`nTop 10 Results:" -ForegroundColor Cyan
 $sortedResults | Select-Object -First 10 | Format-Table `
-    UserPrincipalName, Email, DisplayName, PhoneType, PhoneNumber, SMSCapable -AutoSize
+    UserPrincipalName, Email, PhoneType, PhoneNumber, SMSCapable, SecurityQuestionsRegistered -AutoSize
 
-# --- Export full list ---
+# --- Export FULL list (Format-List) ---
 $sortedResults | Format-List * | Out-String | Set-Content $reportPath
 
-Write-Host "`nFull report exported (list format): $reportPath" -ForegroundColor Green
+Write-Host "`nFull report exported: $reportPath" -ForegroundColor Green
 
 Disconnect-MgGraph
