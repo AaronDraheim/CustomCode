@@ -1,0 +1,105 @@
+<#Disclaimer
+The sample scripts are not supported under any Microsoft standard support program or service.
+The sample scripts are provided AS IS without warranty of any kind. Microsoft further disclaims all implied warranties
+including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
+The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
+In no event shall Microsoft, its authors, or anyone else involved in the creation, production, or delivery of the scripts
+be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption,
+loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
+documentation, even if Microsoft has been advised of the possibility of such damages. #>
+
+Import-Module Microsoft.Graph.Identity.SignIns
+Import-Module Microsoft.Graph.Users
+
+Connect-MgGraph -Scopes @(
+    "UserAuthenticationMethod.Read.All",
+    "User.Read.All"
+)
+
+# --- Output path ---
+$timestamp  = Get-Date -Format 'yyyyMMdd_HHmm'
+$reportPath = "C:\PhoneAuth_Report_$timestamp.csv"
+
+# --- Collection ---
+$results = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+Write-Host "`n===== DISCOVERY (NO CONVERSION) =====" -ForegroundColor Cyan
+Write-Host "Retrieving all users..." -ForegroundColor Cyan
+
+# Include Mail property
+$users   = Get-MgUser -All -Property Id,DisplayName,UserPrincipalName,Mail,Department,JobTitle
+$total   = $users.Count
+$counter = 0
+
+foreach ($user in $users) {
+    $counter++
+    Write-Progress -Activity "Discovering phone auth methods" `
+                   -Status "$counter of $total — $($user.UserPrincipalName)" `
+                   -PercentComplete (($counter / $total) * 100)
+
+    try {
+        $phoneMethods = Get-MgUserAuthenticationPhoneMethod -UserId $user.Id -ErrorAction Stop
+
+        if (-not $phoneMethods) {
+            $results.Add([PSCustomObject]@{
+                UserPrincipalName = $user.UserPrincipalName
+                Email            = $user.Mail
+                DisplayName      = $user.DisplayName
+                Department       = $user.Department
+                JobTitle         = $user.JobTitle
+                PhoneType        = "None"
+                PhoneNumber      = "N/A"
+                SMSCapable       = "No"
+                VoiceCapable     = "No"
+            })
+            continue
+        }
+
+        foreach ($method in $phoneMethods) {
+            $phoneType = $method.PhoneType
+            $smsCapable = $phoneType -in @("mobile", "alternateMobile")
+
+            $results.Add([PSCustomObject]@{
+                UserPrincipalName = $user.UserPrincipalName
+                Email            = $user.Mail
+                DisplayName      = $user.DisplayName
+                Department       = $user.Department
+                JobTitle         = $user.JobTitle
+                PhoneType        = $phoneType
+                PhoneNumber      = $method.PhoneNumber
+                SMSCapable       = if ($smsCapable) { "Yes" } else { "No" }
+                VoiceCapable     = "Yes"
+            })
+        }
+    }
+    catch {
+        $results.Add([PSCustomObject]@{
+            UserPrincipalName = $user.UserPrincipalName
+            Email            = $user.Mail
+            DisplayName      = $user.DisplayName
+            Department       = $user.Department
+            JobTitle         = $user.JobTitle
+            PhoneType        = "ERROR"
+            PhoneNumber      = "N/A"
+            SMSCapable       = "N/A"
+            VoiceCapable     = "N/A"
+        })
+    }
+}
+
+Write-Progress -Activity "Discovering phone auth methods" -Completed
+
+# --- Sort results ---
+$sortedResults = $results | Sort-Object UserPrincipalName
+
+# --- Top 10 to console ---
+Write-Host "`nTop 10 Results:" -ForegroundColor Cyan
+$sortedResults | Select-Object -First 10 | Format-Table `
+    UserPrincipalName, Email, DisplayName, PhoneType, PhoneNumber, SMSCapable -AutoSize
+
+# --- Export full list ---
+$sortedResults | Format-List * | Out-String | Set-Content $reportPath
+
+Write-Host "`nFull report exported (list format): $reportPath" -ForegroundColor Green
+
+Disconnect-MgGraph
