@@ -7,105 +7,298 @@ In no event shall Microsoft, its authors, or anyone else involved in the creatio
 be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption,
 loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
 documentation, even if Microsoft has been advised of the possibility of such damages. #>
-Import-Module Microsoft.Graph.Identity.SignIns
-Import-Module Microsoft.Graph.Users
+<#
+Purpose
+- Audit users in partially migrated / pre-combined-registration environments
+- Combine:
+    1) Authentication method registration report (tenant-wide audit view)
+    2) Legacy per-user MFA state (beta auth requirements endpoint)
+    3) Direct phone method enumeration (exact phone method objects)
 
-Connect-MgGraph -Scopes @(
-    "UserAuthenticationMethod.Read.All",
-    "User.Read.All"
+What this script gives you
+- UPN + Email
+- Per-user MFA state: disabled / enabled / enforced
+- MFA/SSPR registration and capability flags
+- Registered methods from the reporting API
+- Direct phone methods with Microsoft-documented phoneMethodId mapping
+- Modern security question object presence (if surfaced in auth methods API)
+- Best-effort legacy signal when SSPR is registered but no modern security question object is present
+
+Notes
+- "BestEffortLegacySecurityQuestionsSignal" is heuristic only.
+- Microsoft does not let admins read users' security questions/answers.
+- In partially migrated tenants, some user data may surface differently across APIs.
+#>
+
+param(
+    [string]$OutputFolder = 'C:\Temp',
+    [switch]$IncludeDisabledUsers
 )
 
-# --- Output path ---
-$timestamp  = Get-Date -Format 'yyyyMMdd_HHmm'
-$reportPath = "C:\AuthMethods_Audit_$timestamp.txt"
+# =========================
+# Modules
+# =========================
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+Import-Module Microsoft.Graph.Users -ErrorAction Stop
+Import-Module Microsoft.Graph.Identity.SignIns -ErrorAction Stop
+Import-Module Microsoft.Graph.Reports -ErrorAction Stop
 
-# --- Collection ---
-$results = [System.Collections.Generic.List[PSCustomObject]]::new()
+# =========================
+# Connect
+# =========================
+# Delegated scopes chosen for:
+# - user enumeration
+# - direct auth method reads
+# - registration reporting
+# - per-user MFA state reads on beta endpoint
+Connect-MgGraph -Scopes @(
+    'User.Read.All',
+    'UserAuthenticationMethod.Read.All',
+    'AuditLog.Read.All',
+    'Policy.Read.All'
+)
 
-Write-Host "`n===== AUTH METHODS AUDIT =====" -ForegroundColor Cyan
+# =========================
+# Output paths
+# =========================
+if (-not (Test-Path $OutputFolder)) {
+    New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+}
+
+$timestamp   = Get-Date -Format 'yyyyMMdd_HHmm'
+$txtPath     = Join-Path $OutputFolder "LegacyAware_AuthAudit_$timestamp.txt"
+$csvPath     = Join-Path $OutputFolder "LegacyAware_AuthAudit_$timestamp.csv"
+
+# =========================
+# Phone method ID mapping
+# =========================
+$phoneTypeMap = @{
+    '3179e48a-750b-4051-897c-87b9720928f7' = 'mobile'
+    'b6332ec1-7057-4abe-9331-3d72feddfe41' = 'alternateMobile'
+    'e37fc753-ff3b-4958-9484-eaa9425c82bc' = 'office'
+}
+
+# =========================
+# Get tenant-wide registration report
+# =========================
+Write-Host "`nRetrieving authentication method registration report..." -ForegroundColor Cyan
+$registrationReport = Get-MgReportAuthenticationMethodUserRegistrationDetail -All -ErrorAction Stop
+
+# Build lookup by object ID
+$registrationLookup = @{}
+foreach ($item in $registrationReport) {
+    $registrationLookup[$item.Id] = $item
+}
+
+# =========================
+# Get users
+# =========================
 Write-Host "Retrieving users..." -ForegroundColor Cyan
+$users = Get-MgUser -All -Property Id,DisplayName,UserPrincipalName,Mail,Department,JobTitle,AccountEnabled
 
-$users   = Get-MgUser -All -Property Id,DisplayName,UserPrincipalName,Mail,Department,JobTitle
-$total   = $users.Count
+if (-not $IncludeDisabledUsers) {
+    $users = $users | Where-Object { $_.AccountEnabled -eq $true }
+}
+
+$total = $users.Count
 $counter = 0
+
+# =========================
+# Results
+# =========================
+$results = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 foreach ($user in $users) {
     $counter++
-    Write-Progress -Activity "Auditing authentication methods" `
+    Write-Progress -Activity "Auditing authentication state" `
                    -Status "$counter of $total — $($user.UserPrincipalName)" `
                    -PercentComplete (($counter / $total) * 100)
 
+    $reg = $null
+    $perUserMfaState = 'Unknown'
+    $phoneMethods = @()
+    $modernMethods = @()
+    $modernSecurityQuestionsPresent = $false
+
     try {
-        # --- Phone Methods ---
-        $phoneMethods = Get-MgUserAuthenticationPhoneMethod -UserId $user.Id -ErrorAction SilentlyContinue
+        if ($registrationLookup.ContainsKey($user.Id)) {
+            $reg = $registrationLookup[$user.Id]
+        }
 
-        # --- Security Questions (SSPR) ---
-        # Graph method for security questions
-        $securityQuestions = Get-MgUserAuthenticationMethod -UserId $user.Id -ErrorAction SilentlyContinue |
-                             Where-Object { $_.'@odata.type' -eq "#microsoft.graph.securityQuestionAuthenticationMethod" }
+        # Legacy-compatible per-user MFA state
+        try {
+            $requirements = Invoke-MgGraphRequest `
+                -Method GET `
+                -Uri "https://graph.microsoft.com/beta/users/$($user.Id)/authentication/requirements" `
+                -OutputType PSObject `
+                -ErrorAction Stop
 
-        $hasSecurityQuestions = if ($securityQuestions) { "Yes" } else { "No" }
+            if ($null -ne $requirements.perUserMfaState) {
+                $perUserMfaState = [string]$requirements.perUserMfaState
+            }
+        }
+        catch {
+            $perUserMfaState = 'Unavailable'
+        }
 
-        if (-not $phoneMethods) {
-            $results.Add([PSCustomObject]@{
-                UserPrincipalName = $user.UserPrincipalName
-                Email            = $user.Mail
-                DisplayName      = $user.DisplayName
-                Department       = $user.Department
-                JobTitle         = $user.JobTitle
-                PhoneType        = "None"
-                PhoneNumber      = "N/A"
-                SMSCapable       = "No"
-                SecurityQuestionsRegistered = $hasSecurityQuestions
-            })
+        # Direct phone method enumeration
+        try {
+            $phoneMethods = Get-MgUserAuthenticationPhoneMethod -UserId $user.Id -ErrorAction Stop
+        }
+        catch {
+            $phoneMethods = @()
+        }
+
+        # Full auth methods list for modern security question object presence
+        try {
+            $modernMethods = Get-MgUserAuthenticationMethod -UserId $user.Id -ErrorAction Stop
+            if ($modernMethods | Where-Object { $_.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.securityQuestionAuthenticationMethod' }) {
+                $modernSecurityQuestionsPresent = $true
+            }
+            elseif ($modernMethods | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.securityQuestionAuthenticationMethod' }) {
+                $modernSecurityQuestionsPresent = $true
+            }
+        }
+        catch {
+            $modernMethods = @()
+            $modernSecurityQuestionsPresent = $false
+        }
+
+        # Common report fields
+        $common = [ordered]@{
+            UserPrincipalName                    = $user.UserPrincipalName
+            Email                                = $user.Mail
+            DisplayName                          = $user.DisplayName
+            Department                           = $user.Department
+            JobTitle                             = $user.JobTitle
+            AccountEnabled                       = $user.AccountEnabled
+
+            RegistrationReportFound              = if ($null -ne $reg) { 'Yes' } else { 'No' }
+            IsAdmin                              = if ($null -ne $reg) { $reg.IsAdmin } else { $null }
+            IsMfaRegistered                      = if ($null -ne $reg) { $reg.IsMfaRegistered } else { $null }
+            IsMfaCapable                         = if ($null -ne $reg) { $reg.IsMfaCapable } else { $null }
+            IsPasswordlessCapable                = if ($null -ne $reg) { $reg.IsPasswordlessCapable } else { $null }
+            IsSsprRegistered                     = if ($null -ne $reg) { $reg.IsSsprRegistered } else { $null }
+            IsSsprEnabled                        = if ($null -ne $reg) { $reg.IsSsprEnabled } else { $null }
+            IsSsprCapable                        = if ($null -ne $reg) { $reg.IsSsprCapable } else { $null }
+            IsSystemPreferredAuthMethodEnabled   = if ($null -ne $reg) { $reg.IsSystemPreferredAuthenticationMethodEnabled } else { $null }
+            MethodsRegistered                    = if ($null -ne $reg -and $null -ne $reg.MethodsRegistered) { ($reg.MethodsRegistered -join '; ') } else { '' }
+            LastUpdatedDateTime                  = if ($null -ne $reg) { $reg.LastUpdatedDateTime } else { $null }
+
+            PerUserMfaState                      = $perUserMfaState
+            ModernSecurityQuestionsObjectPresent = if ($modernSecurityQuestionsPresent) { 'Yes' } else { 'No' }
+
+            # Heuristic only for partially migrated tenants
+            BestEffortLegacySecurityQuestionsSignal = if ($modernSecurityQuestionsPresent) {
+                'Modern security question object found'
+            }
+            elseif ($null -ne $reg -and $reg.IsSsprRegistered -eq $true) {
+                'SSPR registered but no modern security question object found (could be legacy/other SSPR registration)'
+            }
+            else {
+                'No evidence found'
+            }
+        }
+
+        if (-not $phoneMethods -or $phoneMethods.Count -eq 0) {
+            $results.Add([PSCustomObject]($common + [ordered]@{
+                PhoneMethodId   = 'None'
+                PhoneTypeMapped = 'None'
+                PhoneTypeRaw    = 'None'
+                PhoneNumber     = ''
+                SMSCapable      = 'No'
+                SmsSignInState  = ''
+            }))
         }
         else {
             foreach ($method in $phoneMethods) {
-                $phoneType = $method.PhoneType
-                $smsCapable = $phoneType -in @("mobile", "alternateMobile")
+                $methodId = [string]$method.Id
+                $mappedType = if ($phoneTypeMap.ContainsKey($methodId)) { $phoneTypeMap[$methodId] } else { 'Unknown' }
+                $smsCapable = if ($mappedType -eq 'mobile') { 'Yes' } else { 'No' }
 
-                $results.Add([PSCustomObject]@{
-                    UserPrincipalName = $user.UserPrincipalName
-                    Email            = $user.Mail
-                    DisplayName      = $user.DisplayName
-                    Department       = $user.Department
-                    JobTitle         = $user.JobTitle
-                    PhoneType        = $phoneType
-                    PhoneNumber      = $method.PhoneNumber
-                    SMSCapable       = if ($smsCapable) { "Yes" } else { "No" }
-                    SecurityQuestionsRegistered = $hasSecurityQuestions
-                })
+                $results.Add([PSCustomObject]($common + [ordered]@{
+                    PhoneMethodId   = $methodId
+                    PhoneTypeMapped = $mappedType
+                    PhoneTypeRaw    = $method.PhoneType
+                    PhoneNumber     = $method.PhoneNumber
+                    SMSCapable      = $smsCapable
+                    SmsSignInState  = $method.SmsSignInState
+                }))
             }
         }
     }
     catch {
         $results.Add([PSCustomObject]@{
-            UserPrincipalName = $user.UserPrincipalName
-            Email            = $user.Mail
-            DisplayName      = $user.DisplayName
-            Department       = $user.Department
-            JobTitle         = $user.JobTitle
-            PhoneType        = "ERROR"
-            PhoneNumber      = "N/A"
-            SMSCapable       = "N/A"
-            SecurityQuestionsRegistered = "Unknown"
+            UserPrincipalName                    = $user.UserPrincipalName
+            Email                                = $user.Mail
+            DisplayName                          = $user.DisplayName
+            Department                           = $user.Department
+            JobTitle                             = $user.JobTitle
+            AccountEnabled                       = $user.AccountEnabled
+            RegistrationReportFound              = 'Error'
+            IsAdmin                              = $null
+            IsMfaRegistered                      = $null
+            IsMfaCapable                         = $null
+            IsPasswordlessCapable                = $null
+            IsSsprRegistered                     = $null
+            IsSsprEnabled                        = $null
+            IsSsprCapable                        = $null
+            IsSystemPreferredAuthMethodEnabled   = $null
+            MethodsRegistered                    = ''
+            LastUpdatedDateTime                  = $null
+            PerUserMfaState                      = 'Error'
+            ModernSecurityQuestionsObjectPresent = 'Error'
+            BestEffortLegacySecurityQuestionsSignal = 'Error'
+            PhoneMethodId                        = 'Error'
+            PhoneTypeMapped                      = 'Error'
+            PhoneTypeRaw                         = 'Error'
+            PhoneNumber                          = ''
+            SMSCapable                           = 'Error'
+            SmsSignInState                       = ''
         })
     }
 }
 
-Write-Progress -Activity "Auditing authentication methods" -Completed
+Write-Progress -Activity "Auditing authentication state" -Completed
 
-# --- Sort results ---
-$sortedResults = $results | Sort-Object UserPrincipalName
+# =========================
+# Sort
+# =========================
+$sortedResults = $results | Sort-Object UserPrincipalName, PhoneTypeMapped
 
-# --- Top 10 ---
-Write-Host "`nTop 10 Results:" -ForegroundColor Cyan
-$sortedResults | Select-Object -First 10 | Format-Table `
-    UserPrincipalName, Email, PhoneType, PhoneNumber, SMSCapable, SecurityQuestionsRegistered -AutoSize
+# =========================
+# Console: Top 10
+# =========================
+Write-Host "`nTop 10 results:" -ForegroundColor Cyan
+$sortedResults |
+    Select-Object -First 10 `
+        UserPrincipalName,
+        Email,
+        PerUserMfaState,
+        IsMfaRegistered,
+        IsSsprRegistered,
+        ModernSecurityQuestionsObjectPresent,
+        PhoneTypeMapped,
+        PhoneNumber,
+        SMSCapable |
+    Format-Table -AutoSize
 
-# --- Export FULL list (Format-List) ---
-$sortedResults | Format-List * | Out-String | Set-Content $reportPath
+# =========================
+# Export full
+# =========================
+$sortedResults | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+$sortedResults | Format-List * | Out-String -Width 4096 | Set-Content -Path $txtPath -Encoding UTF8
 
-Write-Host "`nFull report exported: $reportPath" -ForegroundColor Green
+Write-Host "`nCSV exported: $csvPath" -ForegroundColor Green
+Write-Host "Full list export: $txtPath" -ForegroundColor Green
+
+# =========================
+# Optional summary
+# =========================
+Write-Host "`nSummary:" -ForegroundColor Cyan
+Write-Host ("Total rows exported: {0}" -f $sortedResults.Count)
+Write-Host ("Users with modern security question object: {0}" -f (($sortedResults | Where-Object { $_.ModernSecurityQuestionsObjectPresent -eq 'Yes' } | Select-Object -ExpandProperty UserPrincipalName -Unique).Count))
+Write-Host ("Users with SSPR registered: {0}" -f (($sortedResults | Where-Object { $_.IsSsprRegistered -eq $true } | Select-Object -ExpandProperty UserPrincipalName -Unique).Count))
+Write-Host ("Users with per-user MFA enabled/enforced: {0}" -f (($sortedResults | Where-Object { $_.PerUserMfaState -in @('enabled','enforced') } | Select-Object -ExpandProperty UserPrincipalName -Unique).Count))
 
 Disconnect-MgGraph
