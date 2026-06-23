@@ -1,0 +1,606 @@
+#add Hardware Token
+<#Disclaimer
+The sample scripts are not supported under any Microsoft standard support program or service.
+The sample scripts are provided AS IS without warranty of any kind. Microsoft further disclaims all implied warranties
+including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
+The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
+In no event shall Microsoft, its authors, or anyone else involved in the creation, production, or delivery of the scripts
+be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption,
+loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
+documentation, even if Microsoft has been advised of the possibility of such damages.
+#>
+
+# PARAMETERS: destination folder for exported audit files (defaults to C:\Temp).
+param(
+    [string]$OutputFolder = 'C:\Temp'
+)
+
+# =========================
+# MODULES
+# =========================
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+Import-Module Microsoft.Graph.Users -ErrorAction Stop
+Import-Module Microsoft.Graph.Identity.SignIns -ErrorAction Stop
+Import-Module Microsoft.Graph.Reports -ErrorAction Stop
+
+# Detect the optional ImportExcel module; if present, export to .xlsx, otherwise fall back to CSV.
+$UseExcel = $false
+try {
+    if (Get-Module -ListAvailable -Name ImportExcel) {
+        Import-Module ImportExcel -ErrorAction Stop
+        $UseExcel = $true
+    }
+}
+catch {
+    $UseExcel = $false
+}
+
+# =========================
+# CONSTANTS
+# =========================
+# Maps Graph phone-method GUIDs to friendly phone types (mobile / alternateMobile / office).
+$script:PhoneTypeMap = @{
+    '3179e48a-750b-4051-897c-87b9720928f7' = 'mobile'
+    'b6332ec1-7057-4abe-9331-3d72feddfe41' = 'alternateMobile'
+    'e37fc753-ff3b-4958-9484-eaa9425c82bc' = 'office'
+}
+
+# =========================
+# CONNECTION FUNCTIONS
+# =========================
+# Safely tear down any existing Microsoft Graph session.
+function Disconnect-GraphSession {
+    try {
+        if (Get-MgContext) {
+            Disconnect-MgGraph | Out-Null
+            Write-Host "Disconnected from Microsoft Graph." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "No active Microsoft Graph session found." -ForegroundColor DarkYellow
+        }
+    }
+    catch {
+        Write-Host "Disconnect attempt completed." -ForegroundColor Yellow
+    }
+}
+
+# Connect to Microsoft Graph with the scopes required for the audit.
+function Connect-GraphSession {
+    Disconnect-GraphSession
+    Write-Host "`nConnecting to Microsoft Graph..." -ForegroundColor Cyan
+    try {
+        Connect-MgGraph -Scopes @(
+            'User.Read.All',
+            'UserAuthenticationMethod.Read.All',
+            'AuditLog.Read.All',
+            'Policy.Read.All'
+        ) -NoWelcome | Out-Null
+
+        if (Get-MgContext) {
+            Write-Host "Connected." -ForegroundColor Green
+        }
+        else {
+            Write-Host "Connection did not complete." -ForegroundColor Red
+        }
+    }
+    catch {
+        Write-Host "Connection failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+# Verify an active Graph session exists before running an audit.
+function Test-GraphConnection {
+    if (-not (Get-MgContext)) {
+        Write-Host "Not connected to Microsoft Graph. Use option 1 first." -ForegroundColor Red
+        return $false
+    }
+    return $true
+}
+
+# =========================
+# TENANT SMS POLICY (queried once per run)
+# =========================
+# Query the tenant SMS authentication-method policy state (run once per audit).
+function Get-TenantSmsPolicyState {
+    $result = [PSCustomObject]@{
+        SmsPolicyEnabled = $false
+        SmsPolicyState   = 'Unknown'
+    }
+
+    try {
+        $policy = Invoke-MgGraphRequest `
+            -Method GET `
+            -Uri "https://graph.microsoft.com/beta/policies/authenticationMethodsPolicy/authenticationMethodConfigurations/Sms" `
+            -OutputType PSObject `
+            -ErrorAction Stop
+
+        $state = $null
+        if ($policy.PSObject.Properties.Name -contains 'state') {
+            $state = [string]$policy.state
+        }
+        elseif ($policy.PSObject.Properties.Name -contains 'AdditionalProperties' -and
+                $null -ne $policy.AdditionalProperties -and
+                $policy.AdditionalProperties.ContainsKey('state')) {
+            $state = [string]$policy.AdditionalProperties['state']
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($state)) {
+            $result.SmsPolicyState   = $state
+            $result.SmsPolicyEnabled = ($state -eq 'enabled')
+        }
+    }
+    catch {
+        $result.SmsPolicyState = 'Unavailable'
+    }
+
+    return $result
+}
+
+# =========================
+# Helper: reads a true/false property from a registration-report row, whether Graph returns the name as 'isMfaCapable' (REST/JSON) or 'IsMfaCapable' (PowerShell SDK).
+function Get-RegistrationBool {param($RegistrationRecord,[string]$Lower,[string]$Pascal)if ($null -eq $RegistrationRecord) { return $false }if ($RegistrationRecord.PSObject.Properties.Name -contains $Lower -and $null -ne $RegistrationRecord.$Lower) { return [bool]$RegistrationRecord.$Lower }if ($RegistrationRecord.PSObject.Properties.Name -contains $Pascal -and $null -ne $RegistrationRecord.$Pascal) { return [bool]$RegistrationRecord.$Pascal }return $false}
+# Helper: return the methodsRegistered array from a registration-report row.
+function Get-RegistrationMethods {param($RegistrationRecord)if ($null -eq $RegistrationRecord) { return @() }if ($RegistrationRecord.PSObject.Properties.Name -contains 'methodsRegistered' -and $null -ne $RegistrationRecord.methodsRegistered) { return @($RegistrationRecord.methodsRegistered) }if ($RegistrationRecord.PSObject.Properties.Name -contains 'MethodsRegistered' -and $null -ne $RegistrationRecord.MethodsRegistered) { return @($RegistrationRecord.MethodsRegistered) }return @()}
+# Helper: return true if any value matches any of the supplied regex patterns.
+function Test-StringPatternMatch {param([Parameter()][object[]]$Values = @(),[Parameter()][string[]]$Patterns = @())foreach ($value in @($Values)) {$text = [string]$value;foreach ($pattern in @($Patterns)) {if ($text -match $pattern) { return $true }}}return $false}
+# Determine whether the user has security questions registered.
+function Get-SecurityQuestionStatus {param($RegistrationRecord,[bool]$ModernSecurityQuestionFound)$registered = $ModernSecurityQuestionFound;if (-not $registered -and $null -ne $RegistrationRecord) {$methods = Get-RegistrationMethods -RegistrationRecord $RegistrationRecord;foreach ($m in @($methods)) {if ([string]$m -match 'security' -or [string]$m -match 'question') {$registered = $true;break}}}return [PSCustomObject]@{SecurityQuestionsRegistered = $registered}}
+# Prompt for and validate the number of users to sample.
+function Get-SampleSize {
+    while ($true) {
+        $inputValue = Read-Host "Enter number of users to sample"
+
+        if ([string]::IsNullOrWhiteSpace($inputValue)) {
+            Write-Host "A value is required." -ForegroundColor Red
+            continue
+        }
+
+        $parsedValue = 0
+        if ([int]::TryParse($inputValue, [ref]$parsedValue) -and $parsedValue -gt 0) {
+            return $parsedValue
+        }
+
+        Write-Host "Enter a whole number greater than 0." -ForegroundColor Red
+    }
+}
+# Prompt for an optional UPN-suffix domain filter (comma-separated; * = all domains).
+function Get-DomainFilter {
+    while ($true) {
+        Write-Host ""
+        Write-Host "Optional domain filter" -ForegroundColor Cyan
+        Write-Host "Examples:"
+        Write-Host "  contoso.com"
+        Write-Host "  contoso.com,fabrikam.com"
+        Write-Host "  *   (all domains / no filter)"
+        $inputValue = Read-Host "Enter UPN domain filter"
+
+        if ([string]::IsNullOrWhiteSpace($inputValue) -or $inputValue -eq '*') {
+            return @()
+        }
+
+        $domains = $inputValue.Split(',') |
+            ForEach-Object { $_.Trim().ToLowerInvariant() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Sort-Object -Unique
+
+        if (@($domains).Count -gt 0) {
+            return @($domains)
+        }
+
+        Write-Host "Enter one or more valid domains, or * for all." -ForegroundColor Red
+    }
+}
+# Prompt for one or more specific UPNs to target.
+function Get-UpnFilter {
+    while ($true) {
+        Write-Host ""
+        Write-Host "Specific UPN filter" -ForegroundColor Cyan
+        Write-Host "Examples:"
+        Write-Host "  user1@contoso.com"
+        Write-Host "  user1@contoso.com,user2@contoso.com"
+        Write-Host "  *   (cancel / none)"
+        $inputValue = Read-Host "Enter one or more specific UPNs"
+
+        if ([string]::IsNullOrWhiteSpace($inputValue) -or $inputValue -eq '*') {
+            return @()
+        }
+
+        $upns = $inputValue.Split(',') |
+            ForEach-Object { $_.Trim().ToLowerInvariant() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Sort-Object -Unique
+
+        if (@($upns).Count -gt 0) {
+            return @($upns)
+        }
+
+        Write-Host "Enter one or more valid UPNs, or * to cancel." -ForegroundColor Red
+    }
+}
+# Summarize a user's phone methods into types, numbers, and access mode.
+function Get-UserPhoneSummary {param([Parameter()][object[]]$PhoneMethods = @())$phoneTypes = [System.Collections.Generic.List[string]]::new();$phoneNumbers = [System.Collections.Generic.List[string]]::new();$hasMobile = $false;$hasAlternateMobile = $false;$hasOffice = $false;foreach ($phone in @($PhoneMethods)) {$phoneType = $null;if ($phone.PSObject.Properties.Name -contains 'PhoneType' -and $null -ne $phone.PhoneType) {$phoneType = [string]$phone.PhoneType}elseif ($phone.PSObject.Properties.Name -contains 'AdditionalProperties' -and $null -ne $phone.AdditionalProperties -and $phone.AdditionalProperties.ContainsKey('phoneType')) {$phoneType = [string]$phone.AdditionalProperties['phoneType']}elseif ($script:PhoneTypeMap.ContainsKey([string]$phone.Id)) {$phoneType = $script:PhoneTypeMap[[string]$phone.Id]}if ([string]::IsNullOrWhiteSpace($phoneType)) {$phoneType = 'Unknown'}$phoneTypes.Add($phoneType);switch ($phoneType) {'mobile' {$hasMobile = $true}'alternateMobile' {$hasAlternateMobile = $true}'office' {$hasOffice = $true}}if ($phone.PSObject.Properties.Name -contains 'PhoneNumber' -and -not [string]::IsNullOrWhiteSpace([string]$phone.PhoneNumber)) {$phoneNumbers.Add([string]$phone.PhoneNumber)}}$phoneAccessMode = if ($hasMobile) { 'SMS and voice call (mobile)' } elseif ($hasAlternateMobile -or $hasOffice) { 'Voice call only' } else { 'None' };return [PSCustomObject]@{PhoneTypes = $(if ($phoneTypes.Count -gt 0) { ($phoneTypes | Sort-Object -Unique) -join '; ' } else { 'None' });PhoneNumbers = $(if ($phoneNumbers.Count -gt 0) { ($phoneNumbers | Sort-Object -Unique) -join '; ' } else { '' });PhoneAccessMode = $phoneAccessMode}}
+# Evaluate whether SMS/voice MFA is likely available for the user.
+function Get-SmsMfaCapability {
+    param(
+        $RegistrationRecord,
+        [bool]$MobilePhoneRegisteredLive
+    )
+
+
+    $isMfaCapable    = Get-RegistrationBool -RegistrationRecord $RegistrationRecord -Lower 'isMfaCapable' -Pascal 'IsMfaCapable'
+    $isMfaRegistered = Get-RegistrationBool -RegistrationRecord $RegistrationRecord -Lower 'isMfaRegistered' -Pascal 'IsMfaRegistered'
+
+    $registeredMethods = Get-RegistrationMethods -RegistrationRecord $RegistrationRecord
+
+    # Mobile-only matching. Office numbers are voice-only and are intentionally excluded.
+    $mobileFromReport = Test-StringPatternMatch `
+        -Values $registeredMethods `
+        -Patterns @('mobilePhone', '^sms$')
+
+    $mobilePhoneRegistered = ($MobilePhoneRegisteredLive -or $mobileFromReport)
+
+    $smsMfaLikely = ($mobilePhoneRegistered -eq $true)
+
+    return [PSCustomObject]@{
+        IsMfaCapable          = $isMfaCapable
+        IsMfaRegistered       = $isMfaRegistered
+        MobilePhoneRegistered = $mobilePhoneRegistered
+        SmsMfaLikelyAvailable = $smsMfaLikely
+    }
+}
+
+# Retrieve the user's registered phone authentication methods.
+function Get-UserPhoneMethods {
+    param([Parameter(Mandatory = $true)][string]$UserId)
+    try {
+        return @(Get-MgUserAuthenticationPhoneMethod -UserId $UserId -ErrorAction Stop)
+    }
+    catch {
+        return @()
+    }
+}	
+
+# Build the full inventory of registered auth methods and migration-readiness flags.
+function Get-UserAuthMethodInventory {param([Parameter(Mandatory = $true)][string]$UserId,[Parameter()][object[]]$PhoneMethods = @())$methodNames = [System.Collections.Generic.List[string]]::new();$countableMethodNames = [System.Collections.Generic.List[string]]::new();$modernSQ = $false;$mobileRegistered = $false;$fido2Found = $false;$hardwareOathFound = $false;try {$methods = @(Get-MgUserAuthenticationMethod -UserId $UserId -ErrorAction Stop);foreach ($method in $methods) {$odataType = $null;if ($method.PSObject.Properties.Name -contains 'AdditionalProperties' -and $null -ne $method.AdditionalProperties -and $method.AdditionalProperties.ContainsKey('@odata.type')) {$odataType = [string]$method.AdditionalProperties['@odata.type']}elseif ($method.PSObject.Properties.Name -contains '@odata.type') {$odataType = [string]$method.'@odata.type'}switch ($odataType) {'#microsoft.graph.microsoftAuthenticatorAuthenticationMethod' {$methodNames.Add('Microsoft Authenticator');$countableMethodNames.Add('Microsoft Authenticator')}'#microsoft.graph.passwordlessMicrosoftAuthenticatorAuthenticationMethod' {$methodNames.Add('Authenticator (passwordless)');$countableMethodNames.Add('Authenticator (passwordless)')}'#microsoft.graph.fido2AuthenticationMethod' {$methodNames.Add('FIDO2 security key');$countableMethodNames.Add('FIDO2 security key');$fido2Found = $true}'#microsoft.graph.hardwareOathAuthenticationMethod' {$methodNames.Add('Hardware OATH token');$countableMethodNames.Add('Hardware OATH token');$hardwareOathFound = $true}'#microsoft.graph.windowsHelloForBusinessAuthenticationMethod' {$methodNames.Add('Windows Hello for Business');$countableMethodNames.Add('Windows Hello for Business')}'#microsoft.graph.softwareOathAuthenticationMethod' {$methodNames.Add('Software OATH');$countableMethodNames.Add('Software OATH')}'#microsoft.graph.emailAuthenticationMethod' {$methodNames.Add('Email');$countableMethodNames.Add('Email')}'#microsoft.graph.temporaryAccessPassAuthenticationMethod' {$methodNames.Add('Temporary Access Pass');$countableMethodNames.Add('Temporary Access Pass')}'#microsoft.graph.platformCredentialAuthenticationMethod' {$methodNames.Add('Passkey (platform credential)');$countableMethodNames.Add('Passkey (platform credential)')}'#microsoft.graph.securityQuestionAuthenticationMethod' {$methodNames.Add('Security questions');$countableMethodNames.Add('Security questions');$modernSQ = $true}'#microsoft.graph.phoneAuthenticationMethod' {}}}}catch {}if (-not $fido2Found) {try {$fido2Methods = @(Get-MgUserAuthenticationFido2Method -UserId $UserId -ErrorAction Stop);if (@($fido2Methods).Count -gt 0) {$methodNames.Add('FIDO2 security key');$countableMethodNames.Add('FIDO2 security key')}}catch {}}if (-not $hardwareOathFound) {try {$hardwareOathResponse = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/users/$UserId/authentication/hardwareOathMethods" -OutputType PSObject -ErrorAction Stop;$hardwareOathMethods = @();if ($null -ne $hardwareOathResponse.value) {$hardwareOathMethods = @($hardwareOathResponse.value)}elseif ($null -ne $hardwareOathResponse) {$hardwareOathMethods = @($hardwareOathResponse)}if (@($hardwareOathMethods).Count -gt 0) {$methodNames.Add('Hardware OATH token');$countableMethodNames.Add('Hardware OATH token')}}catch {}}foreach ($phone in @($PhoneMethods)) {$phoneType = $null;if ($phone.PSObject.Properties.Name -contains 'PhoneType' -and $null -ne $phone.PhoneType) {$phoneType = [string]$phone.PhoneType}elseif ($phone.PSObject.Properties.Name -contains 'AdditionalProperties' -and $null -ne $phone.AdditionalProperties -and $phone.AdditionalProperties.ContainsKey('phoneType')) {$phoneType = [string]$phone.AdditionalProperties['phoneType']}elseif ($script:PhoneTypeMap.ContainsKey([string]$phone.Id)) {$phoneType = $script:PhoneTypeMap[[string]$phone.Id]}switch ($phoneType) {'mobile' {$methodNames.Add('Phone call (mobile)');$countableMethodNames.Add('Phone call (mobile)');$mobileRegistered = $true}'alternateMobile' {$methodNames.Add('Phone call (alternate mobile)')}'office' {$methodNames.Add('Phone call (office)')}default {$methodNames.Add('Phone');$countableMethodNames.Add('Phone')}}}$uniqueCountableMethods = @($countableMethodNames | Sort-Object -Unique);return [PSCustomObject]@{AllRegisteredAuthMethods = ($methodNames | Sort-Object -Unique) -join '; ';ModernSecurityQuestion = $modernSQ;MobilePhoneRegistered = $mobileRegistered;CountableRegisteredAuthMethods = ($uniqueCountableMethods -join '; ');CountableRegisteredAuthMethodCount = $uniqueCountableMethods.Count;HasTwoOrMoreCountableAuthMethods = ($uniqueCountableMethods.Count -ge 2)}}
+
+# Return the legacy per-user MFA state (Enabled / Enforced / Disabled).
+function Get-PerUserMfaState {
+    param([Parameter(Mandatory = $true)][string]$UserId)
+    try {
+        $req = Invoke-MgGraphRequest `
+            -Method GET `
+            -Uri "https://graph.microsoft.com/beta/users/$UserId/authentication/requirements" `
+            -OutputType PSObject `
+            -ErrorAction Stop
+        if ($null -ne $req.perUserMfaState) {
+            return [string]$req.perUserMfaState
+        }
+        return 'Unavailable'
+    }
+    catch {
+        return 'Unavailable'
+    }
+}
+# Map internal sign-in method codes to friendly display names.
+function Resolve-AuthMethodName { param([string]$Method) switch ($Method) { 'push' { return 'Microsoft Authenticator notification' } 'sms' { return 'SMS' } 'voiceMobile' { return 'Phone call (mobile)' } 'voiceAlternateMobile' { return 'Phone call (alternate mobile)' } 'voiceOffice' { return 'Phone call (office)' } 'oath' { return 'OATH token' } 'unknownFutureValue' { return 'Unknown future value' } 'Unavailable' { return 'Unavailable' } default { return $Method } } }
+# Read the user's sign-in preferences (system-preferred vs. user-preferred default method).
+function Get-UserSignInMethodView { param([Parameter(Mandatory = $true)][string]$UserId) $result = [PSCustomObject]@{ SignInMode = 'Unknown'; UserDefaultSignInMethod = 'Unavailable'; SystemPreferredEnabled = $null }; try { $prefs = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/users/$UserId/authentication/signInPreferences" -OutputType PSObject -ErrorAction Stop; $isSystemPreferred = $null; $userMethod = $null; if ($prefs.PSObject.Properties.Name -contains 'isSystemPreferredAuthenticationMethodEnabled') { $isSystemPreferred = $prefs.isSystemPreferredAuthenticationMethodEnabled } elseif ($prefs.PSObject.Properties.Name -contains 'IsSystemPreferredAuthenticationMethodEnabled') { $isSystemPreferred = $prefs.IsSystemPreferredAuthenticationMethodEnabled } elseif ($prefs.PSObject.Properties.Name -contains 'AdditionalProperties' -and $null -ne $prefs.AdditionalProperties -and $prefs.AdditionalProperties.ContainsKey('isSystemPreferredAuthenticationMethodEnabled')) { $isSystemPreferred = $prefs.AdditionalProperties['isSystemPreferredAuthenticationMethodEnabled'] }; if ($prefs.PSObject.Properties.Name -contains 'userPreferredMethodForSecondaryAuthentication') { $userMethod = $prefs.userPreferredMethodForSecondaryAuthentication } elseif ($prefs.PSObject.Properties.Name -contains 'UserPreferredMethodForSecondaryAuthentication') { $userMethod = $prefs.UserPreferredMethodForSecondaryAuthentication } elseif ($prefs.PSObject.Properties.Name -contains 'AdditionalProperties' -and $null -ne $prefs.AdditionalProperties -and $prefs.AdditionalProperties.ContainsKey('userPreferredMethodForSecondaryAuthentication')) { $userMethod = $prefs.AdditionalProperties['userPreferredMethodForSecondaryAuthentication'] }; if ($null -ne $isSystemPreferred) { $result.SystemPreferredEnabled = [bool]$isSystemPreferred }; if (-not [string]::IsNullOrWhiteSpace([string]$userMethod)) { $result.UserDefaultSignInMethod = Resolve-AuthMethodName -Method ([string]$userMethod) }; if ($isSystemPreferred -eq $true) { $result.SignInMode = 'SystemPreferred' } elseif ($null -ne $isSystemPreferred -and $isSystemPreferred -eq $false) { $result.SignInMode = 'UserPreferred' } } catch { } return $result }
+
+# Resolve a specific list of UPNs into user objects.
+function Get-TargetedUsers {
+    param([Parameter(Mandatory = $true)][string[]]$UpnFilter)
+    $users = [System.Collections.Generic.List[object]]::new()
+    foreach ($upn in @($UpnFilter)) {
+        try {
+            $u = Get-MgUser -UserId $upn -Property Id,DisplayName,UserPrincipalName,Mail,AccountEnabled -ErrorAction Stop
+            if ($null -ne $u) {
+                $users.Add($u)
+            }
+        }
+        catch {
+            Write-Host "Unable to find user $upn : $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+    return @($users)
+}
+# Build a hashtable of registration-report details keyed by user Id (targeted or full report).
+function Get-RegistrationLookup {
+    param(
+        [string]$Mode,
+        [object[]]$Users,
+        [string[]]$UpnFilter
+    )
+
+    $registrationLookup = @{}
+
+    if ($Mode -eq 'Targeted' -and @($UpnFilter).Count -gt 0 -and @($Users).Count -gt 0) {
+        foreach ($u in @($Users)) {
+            try {
+                $uri = "https://graph.microsoft.com/beta/reports/authenticationMethods/userRegistrationDetails/$($u.Id)"
+                $detail = Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject -ErrorAction Stop
+                if ($null -ne $detail) {
+                    $registrationLookup[$u.Id] = $detail
+                }
+            }
+            catch {
+                # continue if targeted user has no report row
+            }
+        }
+    }
+    else {
+        $registrationReport = Get-MgReportAuthenticationMethodUserRegistrationDetail -All -ErrorAction Stop
+        foreach ($r in $registrationReport) {
+            $registrationLookup[$r.Id] = $r
+        }
+    }
+
+    return $registrationLookup
+}
+# Export the audit results to Excel (or CSV) plus a text summary, with a scoped file name.
+function Export-AuditResults {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Results,
+        [Parameter(Mandatory = $true)][string]$ModeLabel,
+        [Parameter(Mandatory = $true)][ValidateSet('Enabled','All')][string]$AccountScope,
+        [string[]]$DomainFilter = @(),
+        [string[]]$UpnFilter = @()
+    )
+    if (@($Results).Count -eq 0) { Write-Host "No results to export." -ForegroundColor Yellow; return }
+
+    if (-not (Test-Path $OutputFolder)) {
+        New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+    }
+
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmm'
+    $safeModeLabel = $ModeLabel -replace '[^A-Za-z0-9]', ''
+    $scopeLabel = if (@($UpnFilter).Count -gt 0) {
+        'SpecificUPNs'
+    }
+    elseif (@($DomainFilter).Count -gt 0) {
+        (($DomainFilter -join '_') -replace '[^A-Za-z0-9_\-]', '')
+    }
+    else {
+        'AllDomains'
+    }
+
+    $baseName = "AuthAudit_${AccountScope}_${safeModeLabel}_${scopeLabel}_$timestamp"
+
+    if ($UseExcel) {
+        $xlsxPath = Join-Path $OutputFolder "$baseName.xlsx"
+        $Results | Export-Excel `
+            -Path $xlsxPath `
+            -WorksheetName 'AuditResults' `
+            -TableName ("AuthAudit{0}{1}" -f $AccountScope, $safeModeLabel) `
+            -TableStyle Medium6 `
+            -AutoSize `
+            -FreezeTopRow `
+            -BoldTopRow
+        Write-Host "`nExported Excel: $xlsxPath" -ForegroundColor Green
+    }
+    else {
+        $csvPath = Join-Path $OutputFolder "$baseName.csv"
+        $Results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+        Write-Host "`nImportExcel module not found. Exported CSV: $csvPath" -ForegroundColor Yellow
+
+    }
+    $txtPath = Join-Path $OutputFolder "$baseName.txt"
+    $Results | Format-List * | Out-String -Width 4096 | Set-Content -Path $txtPath -Encoding UTF8
+    Write-Host "Exported text: $txtPath" -ForegroundColor Green
+}
+# Core audit engine: retrieve users, apply scope/domain/UPN filters, collect auth data, export results.
+function Run-Audit {
+    param(
+        [string]$Mode = 'Full',
+        [Parameter(Mandatory = $true)][ValidateSet('Enabled','All')][string]$AccountScope,
+        [int]$SampleSize = 0,
+        [string[]]$DomainFilter = @(),
+        [string[]]$UpnFilter = @()
+    )
+
+    if (-not (Test-GraphConnection)) {
+        return
+    }
+
+    $modeLabel = switch ($Mode) {
+        'Sample'   { "Sample$SampleSize" }
+        'Targeted' { 'TargetedUPN' }
+        default    { 'Full' }
+    }
+
+    Write-Host "`nStarting $modeLabel audit for $AccountScope accounts..." -ForegroundColor Cyan
+
+    if (@($UpnFilter).Count -gt 0) {
+        Write-Host "UPN filter: $($UpnFilter -join ', ')" -ForegroundColor DarkCyan
+    }
+    elseif (@($DomainFilter).Count -gt 0) {
+        Write-Host "Domain filter: $($DomainFilter -join ', ')" -ForegroundColor DarkCyan
+    }
+    else {
+        Write-Host "Domain filter: All domains" -ForegroundColor DarkCyan
+    }
+
+    $tenantSms = Get-TenantSmsPolicyState
+    Write-Host "Tenant SMS method policy state: $($tenantSms.SmsPolicyState)" -ForegroundColor DarkCyan
+
+    Write-Progress -Activity "Preparing Audit" -Status "Retrieving users..." -PercentComplete 10
+
+    try {
+        if ($Mode -eq 'Targeted' -and @($UpnFilter).Count -gt 0) {
+            $users = @(Get-TargetedUsers -UpnFilter $UpnFilter)
+            if ($AccountScope -eq 'Enabled') {
+                $users = @($users | Where-Object { $_.AccountEnabled -eq $true })
+            }
+        }
+        else {
+            $users = @(Get-MgUser -All -Property Id,DisplayName,UserPrincipalName,Mail,AccountEnabled -ErrorAction Stop)
+
+            if ($AccountScope -eq 'Enabled') {
+                $users = @($users | Where-Object { $_.AccountEnabled -eq $true })
+            }
+
+            if (@($DomainFilter).Count -gt 0) {
+                $users = @($users | Where-Object {
+                    $upnDomain = $null
+                    if (-not [string]::IsNullOrWhiteSpace($_.UserPrincipalName) -and $_.UserPrincipalName -match '@') {
+                        $upnDomain = ($_.UserPrincipalName.Split('@')[-1]).ToLowerInvariant()
+                    }
+                    $upnDomain -in $DomainFilter
+                })
+            }
+
+            if (@($UpnFilter).Count -gt 0) {
+                $users = @($users | Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_.UserPrincipalName) -and
+                    $_.UserPrincipalName.ToLowerInvariant() -in $UpnFilter
+                })
+            }
+        }
+    }
+    catch {
+        Write-Host "Failed to retrieve users: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Progress -Activity "Preparing Audit" -Completed
+        return
+    }
+
+    if ($Mode -eq 'Sample') {
+        $users = @($users | Select-Object -First $SampleSize)
+    }
+
+    $total = @($users).Count
+    if ($total -eq 0) {
+        Write-Host "No users found to process." -ForegroundColor Yellow
+        Write-Progress -Activity "Preparing Audit" -Completed
+        return
+    }
+
+    Write-Progress -Activity "Preparing Audit" -Status "Retrieving authentication registration report..." -PercentComplete 25
+
+    try {
+        $registrationLookup = Get-RegistrationLookup -Mode $Mode -Users $users -UpnFilter $UpnFilter
+    }
+    catch {
+        Write-Host "Failed to retrieve registration report: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Progress -Activity "Preparing Audit" -Completed
+        return
+    }
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $counter = 0
+
+    foreach ($user in $users) {
+        $counter++
+        $percent = [math]::Round(25 + (($counter / $total) * 75), 0)
+
+        Write-Progress `
+            -Activity "Auditing Users ($AccountScope / $modeLabel)" `
+            -Status "$counter of $total processed" `
+            -PercentComplete $percent
+
+        $reg = $null
+        if ($registrationLookup.ContainsKey($user.Id)) {
+            $reg = $registrationLookup[$user.Id]
+        }
+
+        try {
+            $perUserMfa = Get-PerUserMfaState -UserId $user.Id
+            $phones     = Get-UserPhoneMethods -UserId $user.Id
+            $phoneSummary = Get-UserPhoneSummary -PhoneMethods @($phones)
+            $authInv    = Get-UserAuthMethodInventory -UserId $user.Id -PhoneMethods @($phones)
+            $sqStatus   = Get-SecurityQuestionStatus -RegistrationRecord $reg -ModernSecurityQuestionFound $authInv.ModernSecurityQuestion
+            $smsCap     = Get-SmsMfaCapability -RegistrationRecord $reg -MobilePhoneRegisteredLive $authInv.MobilePhoneRegistered
+            $signInView = Get-UserSignInMethodView -UserId $user.Id
+        }
+        catch {
+            Write-Host "Failed processing $($user.UserPrincipalName): $($_.Exception.Message)" -ForegroundColor Red
+            continue
+        }
+
+$results.Add([PSCustomObject]@{UserPrincipalName = $user.UserPrincipalName;Email = $user.Mail;AccountEnabled = $user.AccountEnabled;Domain = $(if ($user.UserPrincipalName -match '@') { $user.UserPrincipalName.Split('@')[-1] } else { '' });PerUserMfaState = $perUserMfa;SignInMode = $signInView.SignInMode;UserDefaultSignInMethod = $signInView.UserDefaultSignInMethod;SystemPreferredEnabled = $signInView.SystemPreferredEnabled;IsMfaRegistered = $smsCap.IsMfaRegistered;IsMfaCapable = $smsCap.IsMfaCapable;TenantSmsPolicyState = $tenantSms.SmsPolicyState;MobilePhoneRegistered = $smsCap.MobilePhoneRegistered;SmsMfaLikelyAvailable = $smsCap.SmsMfaLikelyAvailable;SecurityQuestionsRegistered = $sqStatus.SecurityQuestionsRegistered;AllRegisteredAuthMethods = $authInv.AllRegisteredAuthMethods;CountableRegisteredAuthMethodCount = $authInv.CountableRegisteredAuthMethodCount;'Migration Ready' = $authInv.HasTwoOrMoreCountableAuthMethods;PhoneTypes = $phoneSummary.PhoneTypes;PhoneAccessMode = $phoneSummary.PhoneAccessMode})
+    }
+
+    Write-Progress -Activity "Auditing Users" -Completed
+
+$sorted = @($results | Sort-Object UserPrincipalName)
+
+    Export-AuditResults `
+        -Results @($sorted) `
+        -ModeLabel $modeLabel `
+        -AccountScope $AccountScope `
+        -DomainFilter $DomainFilter `
+        -UpnFilter $UpnFilter
+
+    Write-Host "`nAudit complete. Results exported." -ForegroundColor Green
+}
+
+# Sub-menu to choose Sample / Full Tenant / Specific UPN audits for the selected account scope.
+function Show-AuditSubMenu {
+    param([Parameter(Mandatory = $true)][ValidateSet('Enabled','All')][string]$AccountScope)
+
+    while ($true) {
+        Write-Host ""
+        Write-Host "===== $AccountScope ACCOUNTS MENU =====" -ForegroundColor Cyan
+        Write-Host "1. Sample Results (prompt for count)"
+        Write-Host "2. Full Tenant Audit"
+        Write-Host "3. Specific UPN(s)"
+        Write-Host "B. Back"
+
+        $subChoice = Read-Host "Select an option"
+
+        switch ($subChoice.ToUpper()) {
+            '1' {
+                $sampleSize = Get-SampleSize
+                $domainFilter = Get-DomainFilter
+                Run-Audit -Mode 'Sample' -AccountScope $AccountScope -SampleSize $sampleSize -DomainFilter $domainFilter
+            }
+            '2' {
+                $domainFilter = Get-DomainFilter
+                Run-Audit -Mode 'Full' -AccountScope $AccountScope -DomainFilter $domainFilter
+            }
+            '3' {
+                $upnFilter = Get-UpnFilter
+                if (@($upnFilter).Count -gt 0) {
+                    Run-Audit -Mode 'Targeted' -AccountScope $AccountScope -UpnFilter $upnFilter
+                }
+                else {
+                    Write-Host "No UPNs entered." -ForegroundColor Yellow
+                }
+            }
+            'B' {
+                return
+            }
+            default {
+                Write-Host "Invalid selection." -ForegroundColor Red
+            }
+        }
+    }
+}
+
+# =========================
+# MAIN MENU
+# =========================
+# =========================
+:mainLoop while ($true) {
+    Write-Host "`n===== MAIN MENU =====" -ForegroundColor Cyan
+    Write-Host "1. Disconnect / Reconnect Microsoft Graph"
+    Write-Host "2. Audit Enabled Accounts"
+    Write-Host "3. Audit All Accounts"
+    Write-Host "Q. Quit"
+
+    $choice = Read-Host "Select an option"
+
+    switch ($choice.ToUpper()) {
+        '1' { Connect-GraphSession }
+        '2' { Show-AuditSubMenu -AccountScope 'Enabled' }
+        '3' { Show-AuditSubMenu -AccountScope 'All' }
+        'Q' {
+            Disconnect-GraphSession
+            Write-Host "Exiting..." -ForegroundColor Yellow
+            break mainLoop
+        }
+        default {
+            Write-Host "Invalid selection." -ForegroundColor Red
+        }
+    }
+}
+
